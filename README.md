@@ -1,5 +1,5 @@
 
-# Pixel Art Converter v2
+# Pixel Art Converter v2.1
 
 Desktop utility for converting illustrations into crisp pixel-art assets.
 
@@ -7,7 +7,7 @@ Desktop utility for converting illustrations into crisp pixel-art assets.
 
 - **Pixel Perfect Resize:** resizes the image without applying reconstruction adjustments.
 - **Pixel Art Reconstruction:** adds cluster optimization, detail simplification, edge
-  adjustments, and color clustering.
+  adjustments, and color clustering through vectorized NumPy operations.
 
 ## Features
 
@@ -18,7 +18,11 @@ Desktop utility for converting illustrations into crisp pixel-art assets.
 - Adjusts contrast, cleans isolated noise, and preserves transparency.
 - Includes reconstruction controls for clusters, details, edges, silhouette, and color.
 - Optionally reduces the palette to 2–256 colors, with optional dithering.
-- Exports PNG, WebP, and JPEG with a live preview.
+- Shows the current numeric value beside every processing slider.
+- Provides a crisp nearest-neighbor preview with 25%–800% zoom.
+- Includes **Fit** and **100%** preview buttons, Ctrl + mouse-wheel zoom, and scrollbars
+  for enlarged previews.
+- Exports PNG, WebP, and JPEG.
 
 ## Installation and running
 
