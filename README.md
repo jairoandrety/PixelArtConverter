@@ -1,48 +1,39 @@
 
-# Pixel Art Converter
+# Pixel Art Converter v2
 
 Desktop utility for converting illustrations into crisp pixel-art assets.
 
+## Processing modes
+
+- **Pixel Perfect Resize:** resizes the image without applying reconstruction adjustments.
+- **Pixel Art Reconstruction:** adds cluster optimization, detail simplification, edge
+  adjustments, and color clustering.
+
 ## Features
-- Open PNG/JPG/WebP/BMP/TIFF
-- Auto-crop empty near-black margins
-- Output by exact size, width, or height
-- Progressive reduction
-- Final Nearest Neighbor pixel-grid lock
-- Original colors preserved by default
-- Optional palette reduction (2–256 colors)
-- Optional controlled dithering
-- Optional isolated-noise cleanup
-- Contrast adjustment
-- Transparent background option
-- PNG/WebP/JPEG export
-- Live preview
 
-## Recommended settings for your building assets
-- Resize based on: `height`
-- Height: `256`
-- Auto-crop: ON
-- Remove isolated noise: OFF initially
-- Contrast: ~1.06
-- Progressive reduction: ON
-- Hard pixel grid: ON
-- Palette: `0` (preserve colors)
-- Dithering: OFF
-- Transparent background: according to your Unity workflow
+- Opens PNG, JPG, WebP, BMP, and TIFF images.
+- Auto-crops near-black or transparent margins.
+- Supports exact-size, width-based, or height-based output.
+- Provides progressive reduction and a final *Nearest Neighbor* pixel-grid lock.
+- Adjusts contrast, cleans isolated noise, and preserves transparency.
+- Includes reconstruction controls for clusters, details, edges, silhouette, and color.
+- Optionally reduces the palette to 2–256 colors, with optional dithering.
+- Exports PNG, WebP, and JPEG with a live preview.
 
-## Run on Windows
-1. Install Python 3.10+.
-2. Open a terminal in this folder.
-3. Run:
-   `pip install -r requirements.txt`
-4. Run:
-   `python pixel_art_converter.py`
+## Installation and running
 
-## Build an .exe
-Install PyInstaller:
-`pip install pyinstaller`
+Requires Python 3.10 or later.
 
-Then:
-`pyinstaller --noconfirm --onefile --windowed --name PixelArtConverter pixel_art_converter.py`
+```powershell
+python -m pip install -r requirements.txt
+python pixel_art_converter.py
+```
 
-The executable will appear in `dist/`.
+## Build the Windows executable
+
+```powershell
+python -m pip install pyinstaller
+python -m PyInstaller --noconfirm --onefile --windowed --name PixelArtConverter pixel_art_converter.py
+```
+
+The result is generated at `dist\PixelArtConverter.exe`.
