@@ -1,12 +1,91 @@
 
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
-from PIL import Image, ImageFilter, ImageEnhance, ImageTk
+from PIL import Image, ImageTk
 import numpy as np
 from pathlib import Path
 
+from pixel_pipeline import Pipeline, Settings
+
+
+class Tooltip:
+    """Lightweight hover help for Tk widgets."""
+
+    DELAY_MS = 450
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.window = None
+        self.job = None
+
+        widget.bind("<Enter>", self.schedule, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def schedule(self, _event=None):
+        self.cancel()
+        self.job = self.widget.after(self.DELAY_MS, self.show)
+
+    def cancel(self):
+        if self.job is not None:
+            try:
+                self.widget.after_cancel(self.job)
+            except Exception:
+                pass
+            self.job = None
+
+    def show(self):
+        self.job = None
+
+        if self.window is not None:
+            return
+
+        try:
+            x = self.widget.winfo_rootx() + 14
+            y = (
+                self.widget.winfo_rooty()
+                + self.widget.winfo_height()
+                + 6
+            )
+        except Exception:
+            return
+
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(f"+{x}+{y}")
+
+        tk.Label(
+            self.window,
+            text=self.text,
+            justify="left",
+            wraplength=270,
+            background="#ffffe0",
+            foreground="#333333",
+            relief="solid",
+            borderwidth=1,
+            padx=7,
+            pady=5
+        ).pack()
+
+    def hide(self, _event=None):
+        self.cancel()
+
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+
 
 class PixelArtConverter:
+    # Typed numeric fields are validated before a preview is scheduled,
+    # so a partially typed value never reaches the pipeline.
+    NUMERIC_LIMITS = {
+        "width": (0, 4096, "Width"),
+        "height": (0, 4096, "Height"),
+        "palette": (0, 256, "Palette"),
+    }
+
     DEFAULTS = {
         "width": 0,
         "height": 256,
@@ -27,7 +106,6 @@ class PixelArtConverter:
         "clusters": True,
         "detail": True,
         "edges": True,
-        "silhouette": True,
         "color_clusters": True,
 
         "cluster_strength": 35,
@@ -53,11 +131,22 @@ class PixelArtConverter:
         "object_threshold": 18,
         "object_min_area": 3,
         "object_border_color": "#000000",
+
+        "noise_cleanup": False,
+        "noise_strength": 30,
+        "noise_tolerance": 20,
+        "noise_group_tolerance": 2,
+        "noise_max_area": 12,
+        "noise_protect": True,
+
+        "selection_mode": "Rectangle",
+        "brush_size": 3,
+        "local_effects": False,
     }
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Pixel Art Converter v2.4")
+        self.root.title("Pixel Art Converter v2.8")
         self.root.geometry("1370x900")
         self.root.minsize(1150, 760)
 
@@ -65,6 +154,16 @@ class PixelArtConverter:
         self.preview_source = None
         self.preview_img = None
         self.render_job = None
+        self.outer_border_margin_warning = False
+        self.undo_stack = []
+        self.redo_stack = []
+        self.restoring_history = False
+        self.history_hold = False
+        self.selection = None
+        self.selection_shape = None
+        self.selection_anchor = None
+        self.last_render_seconds = 0.0
+        self.noise_pixels_changed = 0
 
         self.zoom = tk.DoubleVar(value=100)
         self.vars = {
@@ -80,6 +179,7 @@ class PixelArtConverter:
             for key, value in self.DEFAULTS.items()
         }
 
+        self.history_state = (dict(self.DEFAULTS), None)
         self.build_ui()
 
     # ---------------------------------------------------------
@@ -93,7 +193,7 @@ class PixelArtConverter:
         ).pack(anchor="w", pady=(8, 4))
 
     def add_scale(self, parent, label, key, minimum, maximum,
-                  integer=True, decimals=0):
+                  integer=True, decimals=0, help_text=None):
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=(3, 0))
 
@@ -113,14 +213,23 @@ class PixelArtConverter:
         self.vars[key].trace_add("write", update_value)
         update_value()
 
-        ttk.Scale(
+        scale = ttk.Scale(
             parent,
             from_=minimum,
             to=maximum,
             variable=self.vars[key],
             orient="horizontal",
             command=lambda _: self.schedule_preview()
-        ).pack(fill="x")
+        )
+        scale.pack(fill="x")
+        scale.bind("<ButtonPress-1>", self.hold_history, add="+")
+        scale.bind("<ButtonRelease-1>", self.release_history, add="+")
+
+        if help_text:
+            Tooltip(row, help_text)
+            Tooltip(scale, help_text)
+
+        return scale
 
     def add_tint_control(self, parent, label, toggle_key, amount_key):
         # Toggle + slider + numeric value on one horizontal row.
@@ -143,6 +252,8 @@ class PixelArtConverter:
             command=lambda _: self.schedule_preview()
         )
         slider.pack(side="left", fill="x", expand=True)
+        slider.bind("<ButtonPress-1>", self.hold_history, add="+")
+        slider.bind("<ButtonRelease-1>", self.release_history, add="+")
 
         value = ttk.Label(row, width=6, anchor="e")
 
@@ -204,14 +315,11 @@ class PixelArtConverter:
         left.bind("<Configure>", update_left_scrollregion)
         left_canvas.bind("<Configure>", resize_left_content)
 
-        def wheel_config(event):
-            left_canvas.yview_scroll(
-                int(-1 * (event.delta / 120)),
-                "units"
-            )
-
-        left.bind("<MouseWheel>", wheel_config)
-        left_canvas.bind("<MouseWheel>", wheel_config)
+        # Wheel bindings are attached to every child at the end of
+        # build_ui so the pointer scrolls the panel from any control.
+        self.left_canvas = left_canvas
+        self.left_outer = left_outer
+        self.reconstruction_widgets = []
 
         right = ttk.Frame(self.root, padding=12)
         right.pack(side="right", fill="both", expand=True)
@@ -224,7 +332,7 @@ class PixelArtConverter:
 
         ttk.Label(
             left,
-            text="v2.4 • Connected Region + Object Outline Tools",
+            text="v2.8 • Local Brush and Fast Segmentation",
             foreground="#666"
         ).pack(anchor="w", pady=(0, 10))
 
@@ -237,6 +345,33 @@ class PixelArtConverter:
             left, text="Export...",
             command=self.export_image
         ).pack(fill="x", pady=3)
+
+        history_row = ttk.Frame(left)
+        history_row.pack(fill="x", pady=3)
+
+        self.undo_button = ttk.Button(
+            history_row,
+            text="Undo",
+            command=self.undo
+        )
+        self.undo_button.pack(side="left", fill="x", expand=True)
+
+        self.redo_button = ttk.Button(
+            history_row,
+            text="Redo",
+            command=self.redo
+        )
+        self.redo_button.pack(
+            side="left", fill="x", expand=True, padx=(4, 0)
+        )
+
+        self.history_label = ttk.Label(
+            left,
+            text="No changes yet",
+            foreground="#666666",
+            wraplength=310
+        )
+        self.history_label.pack(anchor="w", pady=(0, 4))
 
         self.section(left, "PROCESSING MODE")
 
@@ -252,7 +387,10 @@ class PixelArtConverter:
         mode.pack(fill="x")
         mode.bind(
             "<<ComboboxSelected>>",
-            lambda e: self.schedule_preview()
+            lambda e: (
+                self.update_mode_state(),
+                self.schedule_preview()
+            )
         )
 
         self.section(left, "OUTPUT RESOLUTION")
@@ -264,20 +402,32 @@ class PixelArtConverter:
         ttk.Label(resolution, text="Width").grid(
             row=0, column=0, sticky="w"
         )
-        ttk.Entry(
+        width_entry = ttk.Entry(
             resolution,
             textvariable=self.vars["width"],
             width=9
-        ).grid(row=0, column=1, padx=(4, 10))
+        )
+        width_entry.grid(row=0, column=1, padx=(4, 10))
+        Tooltip(
+            width_entry,
+            "Target width in pixels. 0 means the width is derived "
+            "from the height. Used by the width and exact fit modes."
+        )
 
         ttk.Label(resolution, text="Height").grid(
             row=0, column=2, sticky="w"
         )
-        ttk.Entry(
+        height_entry = ttk.Entry(
             resolution,
             textvariable=self.vars["height"],
             width=9
-        ).grid(row=0, column=3, padx=4)
+        )
+        height_entry.grid(row=0, column=3, padx=4)
+        Tooltip(
+            height_entry,
+            "Target height in pixels. 0 means the height is derived "
+            "from the width. Used by the height and exact fit modes."
+        )
 
         fit = ttk.Combobox(
             left,
@@ -338,31 +488,32 @@ class PixelArtConverter:
             ("Optimize pixel clusters", "clusters"),
             ("Simplify small details", "detail"),
             ("Optimize edges", "edges"),
-            ("Preserve silhouette", "silhouette"),
             ("Preserve color clusters", "color_clusters"),
         ]:
-            ttk.Checkbutton(
+            check = ttk.Checkbutton(
                 left, text=text,
                 variable=self.vars[key],
                 command=self.schedule_preview
-            ).pack(anchor="w", pady=2)
+            )
+            check.pack(anchor="w", pady=2)
+            self.reconstruction_widgets.append(check)
 
-        self.add_scale(
+        self.reconstruction_widgets.append(self.add_scale(
             left, "Cluster strength",
             "cluster_strength", 0, 100
-        )
-        self.add_scale(
+        ))
+        self.reconstruction_widgets.append(self.add_scale(
             left, "Detail simplification",
             "detail_strength", 0, 100
-        )
-        self.add_scale(
+        ))
+        self.reconstruction_widgets.append(self.add_scale(
             left, "Edge optimization",
             "edge_strength", 0, 100
-        )
-        self.add_scale(
+        ))
+        self.reconstruction_widgets.append(self.add_scale(
             left, "Color cluster strength",
             "color_strength", 0, 100
-        )
+        ))
 
         self.section(left, "COLOR")
 
@@ -373,14 +524,20 @@ class PixelArtConverter:
             row, text="Palette (0 = original)"
         ).pack(side="left")
 
-        ttk.Spinbox(
+        palette_spin = ttk.Spinbox(
             row,
             from_=0,
             to=256,
             textvariable=self.vars["palette"],
             width=7,
             command=self.schedule_preview
-        ).pack(side="right")
+        )
+        palette_spin.pack(side="right")
+        Tooltip(
+            palette_spin,
+            "Reduce the image to this many colors. 0 keeps the "
+            "original palette."
+        )
 
         ttk.Checkbutton(
             left,
@@ -392,7 +549,7 @@ class PixelArtConverter:
         mono = ttk.Combobox(
             left,
             textvariable=self.vars["monochrome"],
-            values=["Off", "Black", "White"],
+            values=["Off", "Grayscale"],
             state="readonly"
         )
         mono.pack(fill="x", pady=2)
@@ -427,21 +584,47 @@ class PixelArtConverter:
             command=self.schedule_preview
         ).pack(anchor="w", pady=2)
 
-        ttk.Checkbutton(
+        alpha_check = ttk.Checkbutton(
             left,
-            text="Transparent background",
+            text="Preserve transparency",
             variable=self.vars["alpha"],
             command=self.schedule_preview
-        ).pack(anchor="w", pady=2)
+        )
+        alpha_check.pack(anchor="w", pady=2)
+        Tooltip(
+            alpha_check,
+            "Keeps the original alpha channel in the export. When it "
+            "is off, transparent pixels are flattened to black; no "
+            "background is detected or removed."
+        )
 
         self.section(left, "OUTLINE")
 
-        ttk.Checkbutton(
+        border_check = ttk.Checkbutton(
             left,
             text="Add outer border",
             variable=self.vars["border"],
             command=self.schedule_preview
-        ).pack(anchor="w", pady=2)
+        )
+        border_check.pack(anchor="w", pady=2)
+
+        border_hint = ttk.Label(
+            left,
+            text="Output size stays fixed; borders need transparent margin.",
+            foreground="#666666",
+            wraplength=310,
+        )
+        border_hint.pack(anchor="w", pady=(0, 2))
+
+        for widget in (border_check, border_hint):
+            Tooltip(
+                widget,
+                "The border grows outwards from the visible silhouette "
+                "but the canvas is never enlarged, so it can only fill "
+                "transparent pixels that already exist. If content "
+                "touches an edge, the status bar reports a clipped "
+                "border; add margin or reduce the target size."
+            )
 
         self.add_scale(
             left, "Border width",
@@ -483,12 +666,22 @@ class PixelArtConverter:
 
         self.add_scale(
             left, "Color group threshold",
-            "object_threshold", 1, 60
+            "object_threshold", 1, 60,
+            help_text=(
+                "RGB distance allowed between a pixel and the seed "
+                "color of its region. Because the comparison uses the "
+                "seed color, a gradual gradient splits into several "
+                "regions instead of one."
+            )
         )
 
         self.add_scale(
             left, "Minimum object area",
-            "object_min_area", 1, 100
+            "object_min_area", 1, 100,
+            help_text=(
+                "Connected regions smaller than this pixel count are "
+                "discarded and never receive an internal outline."
+            )
         )
 
         obj_row = ttk.Frame(left)
@@ -514,6 +707,154 @@ class PixelArtConverter:
             text="Choose",
             command=self.choose_object_color
         ).pack(side="right", padx=5)
+
+        self.section(left, "NOISE CLEANUP")
+
+        noise_check = ttk.Checkbutton(
+            left,
+            text="Clean small color noise",
+            variable=self.vars["noise_cleanup"],
+            command=self.schedule_preview
+        )
+        noise_check.pack(anchor="w", pady=2)
+        Tooltip(
+            noise_check,
+            "Replaces small stray color fragments with the closest "
+            "adjacent region color. Runs at the final resolution, "
+            "after palette reduction and before any outline."
+        )
+
+        self.add_scale(
+            left, "Cleanup strength",
+            "noise_strength", 0, 100,
+            help_text=(
+                "Higher values remove larger fragments. Low values only "
+                "reach single-pixel speckles."
+            )
+        )
+
+        self.advanced_noise_widgets = []
+
+        self.noise_advanced = tk.BooleanVar(value=False)
+        advanced_frame = ttk.Frame(left)
+
+        ttk.Checkbutton(
+            left,
+            text="Advanced cleanup options",
+            variable=self.noise_advanced,
+            command=lambda: (
+                advanced_frame.pack(fill="x")
+                if self.noise_advanced.get()
+                else advanced_frame.pack_forget()
+            )
+        ).pack(anchor="w", pady=2)
+
+        self.add_scale(
+            advanced_frame, "Cleanup color tolerance",
+            "noise_tolerance", 0, 60,
+            help_text=(
+                "How different an adjacent color may be before it can "
+                "absorb a fragment. Fragments are always exact-color "
+                "groups, so raising this never widens the grouping."
+            )
+        )
+
+        self.add_scale(
+            advanced_frame, "Fragment grouping tolerance",
+            "noise_group_tolerance", 0, 30,
+            help_text=(
+                "How similar two neighboring pixels must be to count as "
+                "the same fragment. At 0 only identical colors group, "
+                "which means nothing is cleaned unless the palette has "
+                "been reduced first. Keep it below the merge tolerance."
+            )
+        )
+
+        self.add_scale(
+            advanced_frame, "Maximum region area",
+            "noise_max_area", 1, 64,
+            help_text=(
+                "Hard ceiling in pixels. Cleanup strength scales up to "
+                "this value and never past it."
+            )
+        )
+
+        protect_check = ttk.Checkbutton(
+            advanced_frame,
+            text="Protect silhouette",
+            variable=self.vars["noise_protect"],
+            command=self.schedule_preview
+        )
+        protect_check.pack(anchor="w", pady=2)
+        Tooltip(
+            protect_check,
+            "Leaves fragments that touch transparency or the canvas "
+            "edge untouched, so the outline of the sprite is preserved."
+        )
+
+        self.section(left, "SELECTION")
+
+        selection_combo = ttk.Combobox(
+            left,
+            textvariable=self.vars["selection_mode"],
+            values=[
+                "Rectangle",
+                "Connected region",
+                "Brush (add)",
+                "Brush (subtract)"
+            ],
+            state="readonly"
+        )
+        selection_combo.pack(fill="x", pady=2)
+        selection_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self.clear_selection()
+        )
+        Tooltip(
+            selection_combo,
+            "Drag on the preview to select a rectangle, click to "
+            "select a connected color region using the internal "
+            "outline tolerance, or paint with the brush to add and "
+            "subtract pixels. Selections mark pixels only; they never "
+            "modify the image."
+        )
+
+        self.add_scale(
+            left, "Brush size",
+            "brush_size", 1, 32,
+            help_text=(
+                "Diameter of the brush dab, in output pixels. Each "
+                "completed stroke is one undoable action."
+            )
+        )
+
+        local_check = ttk.Checkbutton(
+            left,
+            text="Apply color effects to selection only",
+            variable=self.vars["local_effects"],
+            command=self.schedule_preview
+        )
+        local_check.pack(anchor="w", pady=2)
+        Tooltip(
+            local_check,
+            "Restricts invert, grayscale, RGB tints, and noise cleanup "
+            "to the selected pixels. Contrast runs before the resize, "
+            "so it stays global."
+        )
+
+        self.selection_label = ttk.Label(
+            left,
+            text="Selection: none",
+            foreground="#666666",
+            wraplength=310
+        )
+        self.selection_label.pack(anchor="w", pady=(2, 0))
+
+        ttk.Button(
+            left,
+            text="Clear selection",
+            command=self.clear_selection
+        ).pack(fill="x", pady=3)
 
         ttk.Separator(left).pack(fill="x", pady=8)
 
@@ -630,18 +971,648 @@ class PixelArtConverter:
             "<Configure>",
             lambda e: self.render_preview_image()
         )
-        self.canvas.bind(
-            "<MouseWheel>",
-            self.mouse_wheel_zoom
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.canvas.bind(sequence, self.preview_wheel)
+
+        self.canvas.bind("<ButtonPress-1>", self.selection_press)
+        self.canvas.bind("<B1-Motion>", self.selection_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.selection_release)
+
+        # Typed numeric fields refresh the preview on their own, with a
+        # longer debounce so intermediate keystrokes are not rendered.
+        for key in self.NUMERIC_LIMITS:
+            self.vars[key].trace_add(
+                "write",
+                lambda *_: self.schedule_preview(delay=350)
+            )
+
+        self.bind_wheel(self.left_outer, self.config_wheel)
+        self.update_mode_state()
+
+        self.root.bind_all(
+            "<Control-z>", lambda e: self.undo()
         )
-        self.canvas.bind(
-            "<Button-4>",
-            self.mouse_wheel_zoom
+        self.root.bind_all(
+            "<Control-y>", lambda e: self.redo()
         )
-        self.canvas.bind(
-            "<Button-5>",
-            self.mouse_wheel_zoom
+        self.root.bind_all(
+            "<Control-Shift-Z>", lambda e: self.redo()
         )
+
+        self.update_history_buttons()
+
+    # ---------------------------------------------------------
+    # Non-destructive selection
+    # ---------------------------------------------------------
+
+    PREVIEW_ORIGIN = 10
+
+    def canvas_to_image(self, event):
+        """
+        Map a canvas click to final-image coordinates.
+
+        Zoom and scroll offsets are removed, so the result addresses the
+        processed output rather than what happens to be on screen.
+        """
+        if self.preview_source is None:
+            return None
+
+        scale = float(self.zoom.get()) / 100.0
+
+        if scale <= 0:
+            return None
+
+        x = (
+            self.canvas.canvasx(event.x) - self.PREVIEW_ORIGIN
+        ) / scale
+        y = (
+            self.canvas.canvasy(event.y) - self.PREVIEW_ORIGIN
+        ) / scale
+
+        x, y = int(np.floor(x)), int(np.floor(y))
+
+        if not (
+            0 <= x < self.preview_source.width
+            and 0 <= y < self.preview_source.height
+        ):
+            return None
+
+        return x, y
+
+    @staticmethod
+    def rectangle_mask(shape, start, end):
+        """Binary mask for an inclusive rectangle in image coordinates."""
+        height, width = shape
+        x0, y0 = start
+        x1, y1 = end
+
+        left, right = sorted((int(x0), int(x1)))
+        top, bottom = sorted((int(y0), int(y1)))
+
+        left = max(0, left)
+        top = max(0, top)
+        right = min(width - 1, right)
+        bottom = min(height - 1, bottom)
+
+        mask = np.zeros((height, width), dtype=bool)
+
+        if left <= right and top <= bottom:
+            mask[top:bottom + 1, left:right + 1] = True
+
+        return mask
+
+    @staticmethod
+    def region_mask(rgb, alpha, point, tolerance):
+        """
+        Binary mask for the connected color region under a point.
+
+        This reuses the same segmentation the internal outlines use, so
+        clicking selects exactly the region that would be outlined.
+        """
+        labels = Pipeline.segment_color_regions(
+            rgb, alpha, tolerance, 1
+        )
+
+        x, y = point
+        label = labels[y, x]
+
+        if label < 0:
+            return np.zeros(labels.shape, dtype=bool)
+
+        return labels == label
+
+    @staticmethod
+    def brush_mask(shape, center, diameter):
+        """Circular stroke dab, in image coordinates."""
+        height, width = shape
+        x, y = center
+        radius = max(1, int(round(diameter))) / 2.0
+
+        rows = np.arange(height)[:, None] - y
+        columns = np.arange(width)[None, :] - x
+
+        return (columns ** 2 + rows ** 2) <= radius ** 2
+
+    @staticmethod
+    def stroke_points(start, end):
+        """
+        Integer points along a segment.
+
+        Pointer motion is sampled, so a fast drag would otherwise leave
+        gaps between dabs.
+        """
+        x0, y0 = start
+        x1, y1 = end
+        steps = max(abs(x1 - x0), abs(y1 - y0))
+
+        if steps == 0:
+            return [(x0, y0)]
+
+        return [
+            (
+                round(x0 + (x1 - x0) * step / steps),
+                round(y0 + (y1 - y0) * step / steps)
+            )
+            for step in range(steps + 1)
+        ]
+
+    def paint_stroke(self, start, end, additive):
+        """Add or subtract one segment of a brush stroke."""
+        shape = (
+            self.preview_source.height,
+            self.preview_source.width
+        )
+
+        if self.selection is None or self.selection.shape != shape:
+            self.selection = np.zeros(shape, dtype=bool)
+
+        diameter = self.vars["brush_size"].get()
+
+        for point in self.stroke_points(start, end):
+            dab = self.brush_mask(shape, point, diameter)
+
+            if additive:
+                self.selection |= dab
+            else:
+                self.selection &= ~dab
+
+        self.selection_shape = self.selection_signature()
+
+        count = int(self.selection.sum())
+
+        if not count:
+            self.clear_selection()
+            return
+
+        self.selection_label.config(
+            text=f"Selection: brush ({count} px)"
+        )
+        self.draw_selection()
+
+    def selection_signature(self):
+        """Output geometry a selection belongs to."""
+        if self.preview_source is None:
+            return None
+
+        return (self.preview_source.width, self.preview_source.height)
+
+    def set_selection(self, mask, description):
+        self.selection = mask
+        self.selection_shape = self.selection_signature()
+
+        count = int(mask.sum()) if mask is not None else 0
+
+        if not count:
+            self.clear_selection()
+            return
+
+        self.selection_label.config(
+            text=f"Selection: {description} ({count} px)"
+        )
+        self.draw_selection()
+
+    def clear_selection(self, *_):
+        had_selection = self.selection is not None
+
+        self.selection = None
+        self.selection_shape = None
+        self.selection_label.config(text="Selection: none")
+        self.canvas.delete("selection")
+
+        if had_selection:
+            self.record_history("Clear selection")
+
+    def validate_selection(self):
+        """
+        Drop a selection whose coordinates no longer address the output.
+
+        Remapping across a crop or resize would be ambiguous, so the
+        selection is cleared and reported instead of silently moving.
+        """
+        if self.selection is None:
+            return
+
+        if self.selection_shape != self.selection_signature():
+            self.clear_selection()
+            self.selection_label.config(
+                text="Selection cleared: output size changed"
+            )
+
+    def draw_selection(self):
+        """Overlay the selection outline without altering any pixel."""
+        self.canvas.delete("selection")
+
+        if self.selection is None or self.preview_source is None:
+            return
+
+        scale = float(self.zoom.get()) / 100.0
+        rows = np.flatnonzero(self.selection.any(axis=1))
+        cols = np.flatnonzero(self.selection.any(axis=0))
+
+        if not rows.size or not cols.size:
+            return
+
+        self.canvas.create_rectangle(
+            self.PREVIEW_ORIGIN + cols[0] * scale,
+            self.PREVIEW_ORIGIN + rows[0] * scale,
+            self.PREVIEW_ORIGIN + (cols[-1] + 1) * scale,
+            self.PREVIEW_ORIGIN + (rows[-1] + 1) * scale,
+            outline="#00d0ff",
+            dash=(4, 3),
+            width=2,
+            tags="selection"
+        )
+
+    def selection_press(self, event):
+        point = self.canvas_to_image(event)
+
+        if point is None:
+            return
+
+        mode = self.vars["selection_mode"].get()
+
+        if mode.startswith("Brush"):
+            # One stroke is one history action, so recording is held
+            # until the button is released.
+            self.hold_history()
+            self.paint_stroke(point, point, mode == "Brush (add)")
+            self.selection_anchor = point
+            return
+
+        if self.vars["selection_mode"].get() == "Connected region":
+            rgba = np.asarray(self.preview_source.convert("RGBA"))
+
+            self.set_selection(
+                self.region_mask(
+                    np.array(rgba[:, :, :3], copy=True),
+                    np.array(rgba[:, :, 3], copy=True),
+                    point,
+                    int(round(self.vars["object_threshold"].get()))
+                ),
+                "connected region"
+            )
+            self.selection_anchor = None
+            return
+
+        self.selection_anchor = point
+
+    def selection_drag(self, event):
+        if self.selection_anchor is None:
+            return
+
+        point = self.canvas_to_image(event)
+
+        if point is None:
+            return
+
+        mode = self.vars["selection_mode"].get()
+
+        if mode.startswith("Brush"):
+            self.paint_stroke(
+                self.selection_anchor,
+                point,
+                mode == "Brush (add)"
+            )
+            self.selection_anchor = point
+            return
+
+        self.set_selection(
+            self.rectangle_mask(
+                (
+                    self.preview_source.height,
+                    self.preview_source.width
+                ),
+                self.selection_anchor,
+                point
+            ),
+            "rectangle"
+        )
+
+    def selection_release(self, _event=None):
+        was_stroke = (
+            self.selection_anchor is not None
+            and self.vars["selection_mode"].get().startswith("Brush")
+        )
+
+        self.selection_anchor = None
+
+        if was_stroke:
+            self.history_hold = False
+            self.record_history("Brush stroke")
+
+    # ---------------------------------------------------------
+    # Edit history
+    # ---------------------------------------------------------
+
+    HISTORY_LIMIT = 40
+
+    # A render slower than the debounce window gets a busy status.
+    PREVIEW_BUSY_MS = 250
+
+    def snapshot(self):
+        """Compact record of every setting; never a rendered image."""
+        return {
+            key: var.get()
+            for key, var in self.vars.items()
+        }
+
+    def packed_selection(self):
+        """
+        The active mask as 1-bit data, or None.
+
+        Packing keeps a 512 px mask at 32 KB, so a bounded history of
+        strokes stays small next to the image it describes.
+        """
+        if self.selection is None:
+            return None
+
+        return (
+            self.selection.shape,
+            np.packbits(self.selection).tobytes()
+        )
+
+    @staticmethod
+    def unpack_selection(packed):
+        if packed is None:
+            return None
+
+        shape, data = packed
+        bits = np.unpackbits(
+            np.frombuffer(data, dtype=np.uint8)
+        )
+
+        return bits[:shape[0] * shape[1]].astype(bool).reshape(shape)
+
+    def current_state(self):
+        """Settings plus selection metadata; never a rendered image."""
+        return (self.snapshot(), self.packed_selection())
+
+    @staticmethod
+    def describe_change(before, after):
+        """Human-readable label for the difference between two snapshots."""
+        changed = [
+            key
+            for key in after
+            if before.get(key) != after[key]
+        ]
+
+        if not changed:
+            return None
+
+        if len(changed) > 3:
+            return f"{len(changed)} settings"
+
+        parts = []
+
+        for key in changed:
+            label = key.replace("_", " ").capitalize()
+            value = after[key]
+
+            if isinstance(value, bool):
+                parts.append(f"{label} {'on' if value else 'off'}")
+            elif isinstance(value, float):
+                parts.append(f"{label} {value:.2f}")
+            else:
+                parts.append(f"{label} {value}")
+
+        return ", ".join(parts)
+
+    def hold_history(self, _event=None):
+        """Suspend recording while a slider is being dragged."""
+        self.history_hold = True
+
+    def release_history(self, _event=None):
+        """Close a slider drag as a single history entry."""
+        self.history_hold = False
+        self.record_history()
+
+    def record_history(self, label=None):
+        """
+        Store one history entry when the settings actually changed.
+
+        Entries hold setting values only, so the stack stays small no
+        matter how large the rendered image is. Nothing is recorded
+        mid-drag or while a typed value is still invalid.
+        """
+        if self.restoring_history or self.history_hold:
+            return
+
+        if self.numeric_error() is not None:
+            return
+
+        current = self.current_state()
+        description = self.describe_change(
+            self.history_state[0], current[0]
+        )
+
+        if description is None:
+            if self.history_state[1] == current[1]:
+                return
+
+            description = "Selection"
+
+        self.undo_stack.append((self.history_state, label or description))
+        del self.undo_stack[:-self.HISTORY_LIMIT]
+
+        self.redo_stack.clear()
+        self.history_state = current
+        self.update_history_buttons()
+
+    def apply_snapshot(self, state):
+        """Restore settings and selection without recording an entry."""
+        settings, packed = state
+
+        self.restoring_history = True
+
+        try:
+            for key, value in settings.items():
+                if self.vars[key].get() != value:
+                    self.vars[key].set(value)
+        finally:
+            self.restoring_history = False
+
+        self.selection = self.unpack_selection(packed)
+        self.selection_shape = (
+            self.selection_signature()
+            if self.selection is not None
+            else None
+        )
+        self.selection_label.config(
+            text=(
+                "Selection: none"
+                if self.selection is None
+                else f"Selection: restored "
+                     f"({int(self.selection.sum())} px)"
+            )
+        )
+
+        self.history_state = state
+
+        self.border_color_preview.config(
+            bg=self.vars["border_color"].get()
+        )
+        self.object_color_preview.config(
+            bg=self.vars["object_border_color"].get()
+        )
+
+        self.update_mode_state()
+        self.update_history_buttons()
+        self.schedule_preview()
+
+    def undo(self):
+        if not self.undo_stack or self.numeric_error() is not None:
+            return
+
+        state, label = self.undo_stack.pop()
+        self.redo_stack.append((self.current_state(), label))
+        self.apply_snapshot(state)
+
+    def redo(self):
+        if not self.redo_stack or self.numeric_error() is not None:
+            return
+
+        state, label = self.redo_stack.pop()
+        self.undo_stack.append((self.current_state(), label))
+        self.apply_snapshot(state)
+
+    def update_history_buttons(self):
+        self.undo_button.config(
+            state="normal" if self.undo_stack else "disabled"
+        )
+        self.redo_button.config(
+            state="normal" if self.redo_stack else "disabled"
+        )
+
+        if self.undo_stack:
+            text = f"Last change: {self.undo_stack[-1][1]}"
+        else:
+            text = "No changes yet"
+
+        self.history_label.config(text=text)
+
+    # ---------------------------------------------------------
+    # Wheel / panel state
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def wheel_steps(event):
+        """
+        Normalize wheel input across platforms.
+
+        Returns the number of scroll units; negative means up or left.
+        Windows and macOS report ``delta``, X11 reports button 4/5.
+        """
+        num = getattr(event, "num", 0)
+
+        if num == 4:
+            return -1
+        if num == 5:
+            return 1
+
+        delta = int(getattr(event, "delta", 0) or 0)
+
+        if delta == 0:
+            return 0
+
+        # Windows reports multiples of 120; macOS reports small values.
+        if abs(delta) >= 120:
+            return -delta // 120
+
+        return -1 if delta > 0 else 1
+
+    def preview_wheel(self, event):
+        """Ctrl + wheel zooms, Shift + wheel pans, plain wheel scrolls."""
+        steps = self.wheel_steps(event)
+
+        if steps == 0 or self.preview_source is None:
+            return "break"
+
+        if event.state & 0x0004:
+            current = float(self.zoom.get())
+            self.zoom.set(
+                max(
+                    25,
+                    min(800, current * (1.15 ** -steps))
+                )
+            )
+            self.render_preview_image()
+
+        elif event.state & 0x0001:
+            self.canvas.xview_scroll(steps, "units")
+
+        else:
+            self.canvas.yview_scroll(steps, "units")
+
+        return "break"
+
+    def config_wheel(self, event):
+        steps = self.wheel_steps(event)
+
+        if steps:
+            self.left_canvas.yview_scroll(steps, "units")
+
+        return "break"
+
+    def bind_wheel(self, widget, handler):
+        """Bind wheel events on a widget and all of its descendants."""
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, handler, add="+")
+
+        for child in widget.winfo_children():
+            self.bind_wheel(child, handler)
+
+    def update_mode_state(self):
+        """
+        Disable reconstruction-only controls in Pixel Perfect Resize.
+
+        Values are preserved so switching back restores the settings.
+        """
+        state = (
+            "normal"
+            if self.vars["mode"].get() == "Pixel Art Reconstruction"
+            else "disabled"
+        )
+
+        for widget in self.reconstruction_widgets:
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+    # ---------------------------------------------------------
+    # Numeric validation
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def validate_numeric(text, low, high, label):
+        """Return an error message for a typed field, or None if valid."""
+        text = str(text).strip()
+
+        if not text:
+            return f"{label} is empty."
+
+        try:
+            value = int(text)
+        except ValueError:
+            return f"{label} must be a whole number."
+
+        if not low <= value <= high:
+            return f"{label} must be between {low} and {high}."
+
+        return None
+
+    def numeric_error(self):
+        """First invalid typed numeric field, or None when all are valid."""
+        for key, (low, high, label) in self.NUMERIC_LIMITS.items():
+            # Reading the raw Tcl text avoids the TclError an IntVar
+            # raises while a value is still being typed.
+            text = self.root.getvar(str(self.vars[key]))
+            error = self.validate_numeric(text, low, high, label)
+
+            if error is not None:
+                return error
+
+        return None
 
     # ---------------------------------------------------------
     # Colors
@@ -656,6 +1627,7 @@ class PixelArtConverter:
         if color:
             self.vars["border_color"].set(color)
             self.border_color_preview.config(bg=color)
+            self.record_history(f"Border color {color}")
             self.schedule_preview()
 
     def choose_object_color(self):
@@ -667,6 +1639,7 @@ class PixelArtConverter:
         if color:
             self.vars["object_border_color"].set(color)
             self.object_color_preview.config(bg=color)
+            self.record_history(f"Object border color {color}")
             self.schedule_preview()
 
     # ---------------------------------------------------------
@@ -674,8 +1647,13 @@ class PixelArtConverter:
     # ---------------------------------------------------------
 
     def reset(self):
-        for key, value in self.DEFAULTS.items():
-            self.vars[key].set(value)
+        self.restoring_history = True
+
+        try:
+            for key, value in self.DEFAULTS.items():
+                self.vars[key].set(value)
+        finally:
+            self.restoring_history = False
 
         self.zoom.set(100)
 
@@ -686,15 +1664,23 @@ class PixelArtConverter:
             bg=self.vars["object_border_color"].get()
         )
 
+        self.record_history("Reset to defaults")
+        self.update_mode_state()
         self.schedule_preview()
 
     # ---------------------------------------------------------
     # Zoom
     # ---------------------------------------------------------
 
+    def reset_preview_scroll(self):
+        """Return the preview to its top-left corner after a zoom change."""
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
+
     def set_zoom(self, value):
         self.zoom.set(float(value))
         self.render_preview_image()
+        self.reset_preview_scroll()
 
     def fit_zoom(self):
         if self.preview_source is None:
@@ -720,36 +1706,7 @@ class PixelArtConverter:
 
         self.zoom.set(value)
         self.render_preview_image()
-
-    def mouse_wheel_zoom(self, event):
-        if self.preview_source is None:
-            return "break"
-
-        ctrl = bool(event.state & 0x0004)
-
-        if ctrl or event.num in (4, 5):
-            current = float(self.zoom.get())
-
-            if (
-                getattr(event, "delta", 0) > 0
-                or event.num == 4
-            ):
-                new = min(
-                    800,
-                    current * 1.15
-                )
-            else:
-                new = max(
-                    25,
-                    current / 1.15
-                )
-
-            self.zoom.set(new)
-            self.render_preview_image()
-
-            return "break"
-
-        return None
+        self.reset_preview_scroll()
 
     def render_preview_image(self):
         if self.preview_source is None:
@@ -801,6 +1758,8 @@ class PixelArtConverter:
                 text=f"{scale * 100:.0f}%"
             )
 
+            self.draw_selection()
+
         except Exception as e:
             self.status.config(
                 text=f"Preview display error: {e}"
@@ -809,6 +1768,12 @@ class PixelArtConverter:
     # ---------------------------------------------------------
     # Open / crop / resize
     # ---------------------------------------------------------
+
+    def clear_history(self):
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.history_state = self.current_state()
+        self.update_history_buttons()
 
     def open_image(self):
         path = filedialog.askopenfilename(
@@ -837,6 +1802,9 @@ class PixelArtConverter:
                 )
             )
 
+            # A new source image starts a new document, so earlier
+            # settings history no longer applies to what is on screen.
+            self.clear_history()
             self.schedule_preview()
 
         except Exception as e:
@@ -845,792 +1813,27 @@ class PixelArtConverter:
                 str(e)
             )
 
-    def crop_empty(self, img):
-        rgba = np.asarray(img)
-
-        rgb = rgba[:, :, :3].astype(
-            np.int16
-        )
-
-        threshold = int(
-            round(
-                self.vars["crop_threshold"].get()
-            )
-        )
-
-        mask = np.max(
-            rgb,
-            axis=2
-        ) > threshold
-
-        mask &= rgba[:, :, 3] > 5
-
-        ys, xs = np.where(mask)
-
-        if len(xs) == 0:
-            return img
-
-        return img.crop((
-            max(
-                0,
-                int(xs.min()) - 1
-            ),
-            max(
-                0,
-                int(ys.min()) - 1
-            ),
-            min(
-                img.width,
-                int(xs.max()) + 2
-            ),
-            min(
-                img.height,
-                int(ys.max()) + 2
-            )
-        ))
-
-    def calculate_target(self, img):
-        mode = self.vars["fit_mode"].get()
-
-        tw = int(self.vars["width"].get())
-        th = int(self.vars["height"].get())
-
-        if mode == "exact":
-            return max(1, tw), max(1, th)
-
-        if mode == "width":
-            tw = max(1, tw)
-            return (
-                tw,
-                max(
-                    1,
-                    round(
-                        img.height * tw / img.width
-                    )
-                )
-            )
-
-        th = max(1, th)
-
-        return (
-            max(
-                1,
-                round(
-                    img.width * th / img.height
-                )
-            ),
-            th
-        )
-
-    def progressive_resize(self, img, target):
-        if not self.vars["progressive"].get():
-            return img
-
-        current = img
-
-        for height in (
-            768, 512, 384, 320
-        ):
-            if (
-                current.height > height
-                and height > target[1]
-            ):
-                scale = (
-                    height / current.height
-                )
-
-                current = current.resize(
-                    (
-                        max(
-                            1,
-                            round(
-                                current.width * scale
-                            )
-                        ),
-                        height
-                    ),
-                    Image.Resampling.LANCZOS
-                )
-
-        return current
 
     # ---------------------------------------------------------
-    # Pixel-art reconstruction
+    # Processing
     # ---------------------------------------------------------
 
-    def reconstruct_pixel_art(self, img):
-        rgba = np.asarray(
-            img.convert("RGBA"),
-            dtype=np.float32
-        )
-
-        rgb = rgba[:, :, :3]
-        alpha = rgba[:, :, 3]
-
-        h, w = rgb.shape[:2]
-
-        if h < 3 or w < 3:
-            return img
-
-        # Color cluster preservation.
-        cs = (
-            float(
-                self.vars["color_strength"].get()
-            ) / 100.0
-        )
-
-        if (
-            self.vars["color_clusters"].get()
-            and cs > 0
-        ):
-            step = max(
-                1.0,
-                1.0 + cs * 8.0
-            )
-
-            quantized = (
-                np.round(rgb / step) * step
-            )
-
-            rgb = (
-                rgb * (1.0 - cs * 0.15)
-                + quantized * (cs * 0.15)
-            )
-
-        padded = np.pad(
-            rgb,
-            ((1, 1), (1, 1), (0, 0)),
-            mode="edge"
-        )
-
-        neighbors = np.stack(
-            [
-                padded[0:h, 0:w],
-                padded[0:h, 1:w+1],
-                padded[0:h, 2:w+2],
-                padded[1:h+1, 0:w],
-                padded[1:h+1, 2:w+2],
-                padded[2:h+2, 0:w],
-                padded[2:h+2, 1:w+1],
-                padded[2:h+2, 2:w+2],
-            ],
-            axis=0
-        )
-
-        median = np.median(
-            neighbors,
-            axis=0
-        )
-
-        distance = np.linalg.norm(
-            rgb - median,
-            axis=2
-        )
-
-        cluster_strength = (
-            float(
-                self.vars["cluster_strength"].get()
-            ) / 100.0
-        )
-
-        if (
-            self.vars["clusters"].get()
-            and cluster_strength > 0
-        ):
-            amount = np.clip(
-                (35.0 - distance) / 35.0,
-                0.0,
-                1.0
-            )
-
-            amount *= (
-                cluster_strength * 0.18
-            )
-
-            rgb = (
-                rgb * (1.0 - amount[:, :, None])
-                + median * amount[:, :, None]
-            )
-
-        detail_strength = (
-            float(
-                self.vars["detail_strength"].get()
-            ) / 100.0
-        )
-
-        if (
-            self.vars["detail"].get()
-            and detail_strength > 0
-        ):
-            amount = np.clip(
-                (18.0 - distance) / 18.0,
-                0.0,
-                1.0
-            )
-
-            amount *= (
-                detail_strength * 0.10
-            )
-
-            rgb = (
-                rgb * (1.0 - amount[:, :, None])
-                + median * amount[:, :, None]
-            )
-
-        # Stable H x W edge optimization.
-        edge_strength = (
-            float(
-                self.vars["edge_strength"].get()
-            ) / 100.0
-        )
-
-        if (
-            self.vars["edges"].get()
-            and edge_strength > 0
-        ):
-            left = padded[1:h+1, 0:w]
-            right = padded[1:h+1, 2:w+2]
-            up = padded[0:h, 1:w+1]
-            down = padded[2:h+2, 1:w+1]
-
-            hd = np.linalg.norm(
-                left - right,
-                axis=2
-            )
-            vd = np.linalg.norm(
-                up - down,
-                axis=2
-            )
-
-            dl = np.linalg.norm(
-                rgb - left,
-                axis=2
-            )
-            dr = np.linalg.norm(
-                rgb - right,
-                axis=2
-            )
-            du = np.linalg.norm(
-                rgb - up,
-                axis=2
-            )
-            dd = np.linalg.norm(
-                rgb - down,
-                axis=2
-            )
-
-            horizontal_target = np.where(
-                (dl < dr)[:, :, None],
-                left,
-                right
-            )
-
-            vertical_target = np.where(
-                (du < dd)[:, :, None],
-                up,
-                down
-            )
-
-            target = np.where(
-                (hd >= vd)[:, :, None],
-                horizontal_target,
-                vertical_target
-            )
-
-            edge_amount = np.clip(
-                (np.maximum(hd, vd) - 55.0)
-                / 100.0,
-                0.0,
-                1.0
-            )
-
-            edge_amount *= (
-                edge_strength * 0.06
-            )
-
-            rgb = (
-                rgb * (1.0 - edge_amount[:, :, None])
-                + target * edge_amount[:, :, None]
-            )
-
-        rgb = np.clip(
-            np.round(rgb),
-            0,
-            255
-        ).astype(np.uint8)
-
-        result = Image.fromarray(
-            rgb,
-            "RGB"
-        ).convert("RGBA")
-
-        result.putalpha(
-            Image.fromarray(
-                alpha.astype(np.uint8),
-                "L"
-            )
-        )
-
-        return result
-
-    # ---------------------------------------------------------
-    # Color effects
-    # ---------------------------------------------------------
-
-    def apply_color_effects(self, img):
-        rgba = np.asarray(
-            img.convert("RGBA"),
-            dtype=np.float32
-        )
-
-        rgb = rgba[:, :, :3]
-        alpha = rgba[:, :, 3]
-
-        if self.vars["invert"].get():
-            rgb = 255.0 - rgb
-
-        mono = self.vars["monochrome"].get()
-
-        if mono != "Off":
-            luminance = (
-                0.299 * rgb[:, :, 0]
-                + 0.587 * rgb[:, :, 1]
-                + 0.114 * rgb[:, :, 2]
-            )
-
-            if mono == "Black":
-                # Black-and-white using luminance.
-                # Black remains black; bright areas become white.
-                rgb = np.repeat(
-                    luminance[:, :, None],
-                    3,
-                    axis=2
-                )
-
-            elif mono == "White":
-                # White monochrome: brightness is represented
-                # as white with variable intensity.
-                rgb = np.repeat(
-                    luminance[:, :, None],
-                    3,
-                    axis=2
-                )
-
-        # RGB tint controls.
-        # Each enabled component adds/subtracts from its channel.
-        for enabled_key, amount_key, channel in [
-            ("tint_r", "tint_r_amount", 0),
-            ("tint_g", "tint_g_amount", 1),
-            ("tint_b", "tint_b_amount", 2),
-        ]:
-            if self.vars[enabled_key].get():
-                amount = float(
-                    self.vars[amount_key].get()
-                )
-
-                rgb[:, :, channel] = np.clip(
-                    rgb[:, :, channel] + amount,
-                    0,
-                    255
-                )
-
-        rgb = np.clip(
-            np.round(rgb),
-            0,
-            255
-        ).astype(np.uint8)
-
-        result = Image.fromarray(
-            rgb,
-            "RGB"
-        ).convert("RGBA")
-
-        result.putalpha(
-            Image.fromarray(
-                alpha.astype(np.uint8),
-                "L"
-            )
-        )
-
-        return result
-
-    # ---------------------------------------------------------
-    # Outer border
-    # ---------------------------------------------------------
-
-    def add_outer_border(self, img):
-        if not self.vars["border"].get():
-            return img
-
-        rgba = np.asarray(
-            img.convert("RGBA")
-        )
-
-        rgb = rgba[:, :, :3]
-        alpha = rgba[:, :, 3]
-
-        width = int(
-            round(
-                self.vars["border_width"].get()
-            )
-        )
-
-        color = self.hex_to_rgb(
-            self.vars["border_color"].get()
-        )
-
-        # Border follows visible content/alpha.
-        visible = alpha > 5
-
-        # A border is created around the silhouette.
-        for _ in range(max(1, width)):
-            p = np.pad(
-                visible,
-                ((1, 1), (1, 1)),
-                mode="constant",
-                constant_values=False
-            )
-
-            expanded = (
-                p[0:-2, 0:-2]
-                | p[0:-2, 1:-1]
-                | p[0:-2, 2:]
-                | p[1:-1, 0:-2]
-                | p[1:-1, 2:]
-                | p[2:, 0:-2]
-                | p[2:, 1:-1]
-                | p[2:, 2:]
-            )
-
-            border_mask = expanded & ~visible
-
-            # Keep original pixels untouched.
-            rgb[border_mask] = color
-            alpha[border_mask] = 255
-            visible |= border_mask
-
-        result = Image.fromarray(
-            np.dstack((rgb, alpha)).astype(np.uint8),
-            "RGBA"
-        )
-
-        return result
-
-    # ---------------------------------------------------------
-    # Object detection / internal outlines
-    # ---------------------------------------------------------
-
-    def segment_color_regions(self, rgb, alpha, threshold, min_area):
-        """
-        Connected-component segmentation for pixel-art objects.
-
-        Pixels are considered part of the same region when their RGB
-        distance is <= threshold and they are 4-connected. This is more
-        faithful than simply drawing every color boundary because broad
-        areas of a similar color become one object while genuinely
-        different regions remain separate.
-
-        The implementation works on the already-downscaled image, so it
-        stays practical for 128/256/512 px sprites.
-        """
-        h, w = rgb.shape[:2]
-        valid = alpha > 5
-        labels = np.full((h, w), -1, dtype=np.int32)
-        regions = []
-
-        label = 0
-        threshold_sq = float(threshold) ** 2
-
-        # Scanline flood-fill with a stack. We compare each candidate
-        # against the seed color of its connected region.
-        for y in range(h):
-            for x in range(w):
-                if not valid[y, x] or labels[y, x] != -1:
-                    continue
-
-                seed = rgb[y, x].astype(np.int16)
-                stack = [(y, x)]
-                labels[y, x] = label
-                pixels = []
-
-                while stack:
-                    cy, cx = stack.pop()
-                    pixels.append((cy, cx))
-
-                    if cy > 0:
-                        ny, nx = cy - 1, cx
-                        if (
-                            valid[ny, nx]
-                            and labels[ny, nx] == -1
-                        ):
-                            d = rgb[ny, nx].astype(np.int16) - seed
-                            if int(d @ d) <= threshold_sq:
-                                labels[ny, nx] = label
-                                stack.append((ny, nx))
-
-                    if cy + 1 < h:
-                        ny, nx = cy + 1, cx
-                        if (
-                            valid[ny, nx]
-                            and labels[ny, nx] == -1
-                        ):
-                            d = rgb[ny, nx].astype(np.int16) - seed
-                            if int(d @ d) <= threshold_sq:
-                                labels[ny, nx] = label
-                                stack.append((ny, nx))
-
-                    if cx > 0:
-                        ny, nx = cy, cx - 1
-                        if (
-                            valid[ny, nx]
-                            and labels[ny, nx] == -1
-                        ):
-                            d = rgb[ny, nx].astype(np.int16) - seed
-                            if int(d @ d) <= threshold_sq:
-                                labels[ny, nx] = label
-                                stack.append((ny, nx))
-
-                    if cx + 1 < w:
-                        ny, nx = cy, cx + 1
-                        if (
-                            valid[ny, nx]
-                            and labels[ny, nx] == -1
-                        ):
-                            d = rgb[ny, nx].astype(np.int16) - seed
-                            if int(d @ d) <= threshold_sq:
-                                labels[ny, nx] = label
-                                stack.append((ny, nx))
-
-                if len(pixels) >= min_area:
-                    regions.append((label, pixels))
-
-                label += 1
-
-        return labels, regions
-
-    def add_object_borders(self, img):
-        if not self.vars["object_borders"].get():
-            return img
-
-        rgba = np.asarray(img.convert("RGBA"))
-        rgb = rgba[:, :, :3].copy()
-        alpha = rgba[:, :, 3].copy()
-
-        h, w = rgb.shape[:2]
-        if h < 2 or w < 2:
-            return img
-
-        threshold = int(round(self.vars["object_threshold"].get()))
-        width = int(round(self.vars["object_border_width"].get()))
-        min_area = int(round(self.vars["object_min_area"].get()))
-
-        border_color = self.hex_to_rgb(
-            self.vars["object_border_color"].get()
-        )
-
-        labels, regions = self.segment_color_regions(
-            rgb.astype(np.uint8),
-            alpha,
-            threshold,
-            min_area
-        )
-
-        # A region is outlined only against a different region. This avoids
-        # producing noisy outlines inside a single smooth color cluster.
-        boundary = np.zeros((h, w), dtype=bool)
-
-        left_labels = np.full_like(labels, -2)
-        left_labels[:, 1:] = labels[:, :-1]
-
-        right_labels = np.full_like(labels, -2)
-        right_labels[:, :-1] = labels[:, 1:]
-
-        up_labels = np.full_like(labels, -2)
-        up_labels[1:, :] = labels[:-1, :]
-
-        down_labels = np.full_like(labels, -2)
-        down_labels[:-1, :] = labels[1:, :]
-
-        valid = labels >= 0
-
-        boundary |= valid & (left_labels >= 0) & (left_labels != labels)
-        boundary |= valid & (right_labels >= 0) & (right_labels != labels)
-        boundary |= valid & (up_labels >= 0) & (up_labels != labels)
-        boundary |= valid & (down_labels >= 0) & (down_labels != labels)
-
-        # Expand the internal outline by the requested pixel width.
-        for _ in range(max(1, width) - 1):
-            p = np.pad(
-                boundary,
-                ((1, 1), (1, 1)),
-                mode="constant",
-                constant_values=False
-            )
-            boundary = (
-                p[:-2, :-2] | p[:-2, 1:-1] | p[:-2, 2:] |
-                p[1:-1, :-2] | p[1:-1, 1:-1] | p[1:-1, 2:] |
-                p[2:, :-2] | p[2:, 1:-1] | p[2:, 2:]
-            )
-
-        rgb[boundary] = border_color
-        alpha[boundary] = 255
-
-        return Image.fromarray(
-            np.dstack((rgb, alpha)).astype(np.uint8),
-            "RGBA"
-        )
-
-    @staticmethod
-    def hex_to_rgb(value):
-        value = value.lstrip("#")
-
-        if len(value) != 6:
-            return np.array(
-                [0, 0, 0],
-                dtype=np.uint8
-            )
-
-        return np.array(
-            [
-                int(value[0:2], 16),
-                int(value[2:4], 16),
-                int(value[4:6], 16)
-            ],
-            dtype=np.uint8
-        )
-
-    # ---------------------------------------------------------
-    # Full pipeline
-    # ---------------------------------------------------------
+    def build_settings(self):
+        """Normalized snapshot of every processing setting."""
+        return Settings.from_mapping(self.snapshot())
 
     def process(self):
-        if self.src is None:
-            raise ValueError(
-                "Open an image first."
-            )
-
-        img = self.src.copy()
-
-        if self.vars["crop"].get():
-            img = self.crop_empty(img)
-
-        if self.vars["cleanup"].get():
-            rgb = img.convert(
-                "RGB"
-            ).filter(
-                ImageFilter.MedianFilter(3)
-            )
-
-            img = Image.merge(
-                "RGBA",
-                (
-                    *rgb.split(),
-                    img.getchannel("A")
-                )
-            )
-
-        contrast = float(
-            self.vars["contrast"].get()
+        """Run the pipeline on the loaded image and collect its warnings."""
+        pipeline = Pipeline(
+            self.build_settings(),
+            mask=self.selection
         )
+        result = pipeline.run(self.src)
 
-        if abs(contrast - 1.0) > 0.001:
-            rgb = ImageEnhance.Contrast(
-                img.convert("RGB")
-            ).enhance(contrast)
+        self.outer_border_margin_warning = pipeline.outer_border_clipped
+        self.noise_pixels_changed = pipeline.noise_pixels_changed
 
-            img = Image.merge(
-                "RGBA",
-                (
-                    *rgb.split(),
-                    img.getchannel("A")
-                )
-            )
-
-        target = self.calculate_target(img)
-
-        img = self.progressive_resize(
-            img,
-            target
-        )
-
-        resample = (
-            Image.Resampling.NEAREST
-            if self.vars["pixel_final"].get()
-            else Image.Resampling.LANCZOS
-        )
-
-        img = img.resize(
-            target,
-            resample
-        )
-
-        if (
-            self.vars["mode"].get()
-            == "Pixel Art Reconstruction"
-        ):
-            img = self.reconstruct_pixel_art(
-                img
-            )
-
-        img = self.apply_color_effects(img)
-
-        colors = int(
-            self.vars["palette"].get()
-        )
-
-        if colors > 0:
-            colors = max(
-                2,
-                min(256, colors)
-            )
-
-            dither = (
-                Image.Dither.FLOYDSTEINBERG
-                if self.vars["dither"].get()
-                else Image.Dither.NONE
-            )
-
-            rgb = img.convert(
-                "RGB"
-            ).quantize(
-                colors=colors,
-                method=Image.Quantize.MEDIANCUT,
-                dither=dither
-            ).convert("RGB")
-
-            img = Image.merge(
-                "RGBA",
-                (
-                    *rgb.split(),
-                    img.getchannel("A")
-                )
-            )
-
-        img = self.add_outer_border(
-            img
-        )
-
-        img = self.add_object_borders(
-            img
-        )
-
-        if self.vars["alpha"].get():
-            return img.convert("RGBA")
-
-        # If transparency is disabled, flatten transparent
-        # pixels to black instead of producing accidental
-        # alpha artifacts.
-        background = Image.new(
-            "RGB",
-            img.size,
-            (0, 0, 0)
-        )
-        background.paste(
-            img,
-            mask=img.getchannel("A")
-        )
-
-        return background
+        return result
 
     # ---------------------------------------------------------
     # Preview / export
@@ -1650,18 +1853,50 @@ class PixelArtConverter:
             )
             return
 
+        error = self.numeric_error()
+
+        if error is not None:
+            self.status.config(text=error)
+            return
+
+        self.record_history()
+
+        # A render that overran the debounce window last time is very
+        # likely to overrun it again, so say so before starting.
+        slow = self.last_render_seconds * 1000 > self.PREVIEW_BUSY_MS
+
+        if slow:
+            self.status.config(text="Processing preview...")
+            self.status.update_idletasks()
+
         try:
+            started = time.perf_counter()
             img = self.process()
+            self.last_render_seconds = time.perf_counter() - started
 
             self.preview_source = img
+            self.validate_selection()
 
-            self.status.config(
-                text=(
-                    f"Preview: {img.width}×{img.height} px | "
-                    f"{self.vars['mode'].get()} | "
-                    f"Zoom {self.zoom.get():.0f}%"
-                )
+            status = (
+                f"Preview: {img.width}×{img.height} px | "
+                f"{self.vars['mode'].get()} | "
+                f"Zoom {self.zoom.get():.0f}%"
             )
+
+            if self.vars["noise_cleanup"].get():
+                # Without this the controls give no feedback at all when
+                # they happen to clean nothing.
+                status += f" | cleanup {self.noise_pixels_changed} px"
+
+            if self.last_render_seconds * 1000 > self.PREVIEW_BUSY_MS:
+                status += f" | {self.last_render_seconds:.1f} s"
+
+            if getattr(self, "outer_border_margin_warning", False):
+                status += (
+                    " | Outer border clipped: content touches the canvas edge"
+                )
+
+            self.status.config(text=status)
 
             self.render_preview_image()
 
@@ -1670,7 +1905,7 @@ class PixelArtConverter:
                 text=f"Preview error: {e}"
             )
 
-    def schedule_preview(self):
+    def schedule_preview(self, delay=100):
         if self.render_job is not None:
             try:
                 self.root.after_cancel(
@@ -1680,7 +1915,7 @@ class PixelArtConverter:
                 pass
 
         self.render_job = self.root.after(
-            100,
+            delay,
             self.render_preview
         )
 
