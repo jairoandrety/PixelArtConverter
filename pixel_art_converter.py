@@ -57,7 +57,7 @@ class PixelArtConverter:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Pixel Art Converter v2.3")
+        self.root.title("Pixel Art Converter v2.4")
         self.root.geometry("1370x900")
         self.root.minsize(1150, 760)
 
@@ -123,6 +123,7 @@ class PixelArtConverter:
         ).pack(fill="x")
 
     def add_tint_control(self, parent, label, toggle_key, amount_key):
+        # Toggle + slider + numeric value on one horizontal row.
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=2)
 
@@ -131,10 +132,19 @@ class PixelArtConverter:
             text=label,
             variable=self.vars[toggle_key],
             command=self.schedule_preview
-        ).pack(side="left")
+        ).pack(side="left", padx=(0, 5))
+
+        slider = ttk.Scale(
+            row,
+            from_=-100,
+            to=100,
+            variable=self.vars[amount_key],
+            orient="horizontal",
+            command=lambda _: self.schedule_preview()
+        )
+        slider.pack(side="left", fill="x", expand=True)
 
         value = ttk.Label(row, width=6, anchor="e")
-        value.pack(side="right")
 
         def update(*_):
             value.config(
@@ -143,23 +153,65 @@ class PixelArtConverter:
 
         self.vars[amount_key].trace_add("write", update)
         update()
-
-        ttk.Scale(
-            parent,
-            from_=-100,
-            to=100,
-            variable=self.vars[amount_key],
-            orient="horizontal",
-            command=lambda _: self.schedule_preview()
-        ).pack(fill="x")
+        value.pack(side="left", padx=(5, 0))
 
     # ---------------------------------------------------------
     # UI
     # ---------------------------------------------------------
 
     def build_ui(self):
-        left = ttk.Frame(self.root, padding=12)
-        left.pack(side="left", fill="y")
+        # Scrollable configuration panel so every setting remains accessible
+        # even on smaller screens.
+        left_outer = ttk.Frame(self.root)
+        left_outer.pack(side="left", fill="y")
+
+        left_canvas = tk.Canvas(
+            left_outer,
+            width=335,
+            highlightthickness=0,
+            borderwidth=0
+        )
+        left_scroll = ttk.Scrollbar(
+            left_outer,
+            orient="vertical",
+            command=left_canvas.yview
+        )
+        left_canvas.configure(
+            yscrollcommand=left_scroll.set
+        )
+
+        left_canvas.pack(side="left", fill="y", expand=False)
+        left_scroll.pack(side="right", fill="y")
+
+        left = ttk.Frame(left_canvas, padding=12)
+        left_window = left_canvas.create_window(
+            (0, 0),
+            window=left,
+            anchor="nw"
+        )
+
+        def update_left_scrollregion(event=None):
+            left_canvas.configure(
+                scrollregion=left_canvas.bbox("all")
+            )
+
+        def resize_left_content(event):
+            left_canvas.itemconfigure(
+                left_window,
+                width=event.width
+            )
+
+        left.bind("<Configure>", update_left_scrollregion)
+        left_canvas.bind("<Configure>", resize_left_content)
+
+        def wheel_config(event):
+            left_canvas.yview_scroll(
+                int(-1 * (event.delta / 120)),
+                "units"
+            )
+
+        left.bind("<MouseWheel>", wheel_config)
+        left_canvas.bind("<MouseWheel>", wheel_config)
 
         right = ttk.Frame(self.root, padding=12)
         right.pack(side="right", fill="both", expand=True)
@@ -172,7 +224,7 @@ class PixelArtConverter:
 
         ttk.Label(
             left,
-            text="v2.3 • Color + Object Outline Tools",
+            text="v2.4 • Connected Region + Object Outline Tools",
             foreground="#666"
         ).pack(anchor="w", pady=(0, 10))
 
@@ -1268,132 +1320,163 @@ class PixelArtConverter:
     # Object detection / internal outlines
     # ---------------------------------------------------------
 
+    def segment_color_regions(self, rgb, alpha, threshold, min_area):
+        """
+        Connected-component segmentation for pixel-art objects.
+
+        Pixels are considered part of the same region when their RGB
+        distance is <= threshold and they are 4-connected. This is more
+        faithful than simply drawing every color boundary because broad
+        areas of a similar color become one object while genuinely
+        different regions remain separate.
+
+        The implementation works on the already-downscaled image, so it
+        stays practical for 128/256/512 px sprites.
+        """
+        h, w = rgb.shape[:2]
+        valid = alpha > 5
+        labels = np.full((h, w), -1, dtype=np.int32)
+        regions = []
+
+        label = 0
+        threshold_sq = float(threshold) ** 2
+
+        # Scanline flood-fill with a stack. We compare each candidate
+        # against the seed color of its connected region.
+        for y in range(h):
+            for x in range(w):
+                if not valid[y, x] or labels[y, x] != -1:
+                    continue
+
+                seed = rgb[y, x].astype(np.int16)
+                stack = [(y, x)]
+                labels[y, x] = label
+                pixels = []
+
+                while stack:
+                    cy, cx = stack.pop()
+                    pixels.append((cy, cx))
+
+                    if cy > 0:
+                        ny, nx = cy - 1, cx
+                        if (
+                            valid[ny, nx]
+                            and labels[ny, nx] == -1
+                        ):
+                            d = rgb[ny, nx].astype(np.int16) - seed
+                            if int(d @ d) <= threshold_sq:
+                                labels[ny, nx] = label
+                                stack.append((ny, nx))
+
+                    if cy + 1 < h:
+                        ny, nx = cy + 1, cx
+                        if (
+                            valid[ny, nx]
+                            and labels[ny, nx] == -1
+                        ):
+                            d = rgb[ny, nx].astype(np.int16) - seed
+                            if int(d @ d) <= threshold_sq:
+                                labels[ny, nx] = label
+                                stack.append((ny, nx))
+
+                    if cx > 0:
+                        ny, nx = cy, cx - 1
+                        if (
+                            valid[ny, nx]
+                            and labels[ny, nx] == -1
+                        ):
+                            d = rgb[ny, nx].astype(np.int16) - seed
+                            if int(d @ d) <= threshold_sq:
+                                labels[ny, nx] = label
+                                stack.append((ny, nx))
+
+                    if cx + 1 < w:
+                        ny, nx = cy, cx + 1
+                        if (
+                            valid[ny, nx]
+                            and labels[ny, nx] == -1
+                        ):
+                            d = rgb[ny, nx].astype(np.int16) - seed
+                            if int(d @ d) <= threshold_sq:
+                                labels[ny, nx] = label
+                                stack.append((ny, nx))
+
+                if len(pixels) >= min_area:
+                    regions.append((label, pixels))
+
+                label += 1
+
+        return labels, regions
+
     def add_object_borders(self, img):
         if not self.vars["object_borders"].get():
             return img
 
-        rgba = np.asarray(
-            img.convert("RGBA")
-        )
-
-        rgb = rgba[:, :, :3].astype(
-            np.int16
-        )
-        alpha = rgba[:, :, 3]
+        rgba = np.asarray(img.convert("RGBA"))
+        rgb = rgba[:, :, :3].copy()
+        alpha = rgba[:, :, 3].copy()
 
         h, w = rgb.shape[:2]
-
         if h < 2 or w < 2:
             return img
 
-        threshold = int(
-            round(
-                self.vars["object_threshold"].get()
-            )
-        )
-
-        width = int(
-            round(
-                self.vars["object_border_width"].get()
-            )
-        )
-
-        min_area = int(
-            round(
-                self.vars["object_min_area"].get()
-            )
-        )
+        threshold = int(round(self.vars["object_threshold"].get()))
+        width = int(round(self.vars["object_border_width"].get()))
+        min_area = int(round(self.vars["object_min_area"].get()))
 
         border_color = self.hex_to_rgb(
             self.vars["object_border_color"].get()
         )
 
-        # Detect color-group boundaries. Instead of expensive
-        # flood-fill for every pixel, compare neighboring colors.
-        left = np.pad(
-            rgb[:, :-1],
-            ((0, 0), (1, 0), (0, 0)),
-            mode="edge"
+        labels, regions = self.segment_color_regions(
+            rgb.astype(np.uint8),
+            alpha,
+            threshold,
+            min_area
         )
 
-        up = np.pad(
-            rgb[:-1, :],
-            ((1, 0), (0, 0), (0, 0)),
-            mode="edge"
-        )
+        # A region is outlined only against a different region. This avoids
+        # producing noisy outlines inside a single smooth color cluster.
+        boundary = np.zeros((h, w), dtype=bool)
 
-        horizontal_diff = np.linalg.norm(
-            rgb - left,
-            axis=2
-        )
+        left_labels = np.full_like(labels, -2)
+        left_labels[:, 1:] = labels[:, :-1]
 
-        vertical_diff = np.linalg.norm(
-            rgb - up,
-            axis=2
-        )
+        right_labels = np.full_like(labels, -2)
+        right_labels[:, :-1] = labels[:, 1:]
 
-        boundary = (
-            (horizontal_diff >= threshold)
-            | (vertical_diff >= threshold)
-        )
+        up_labels = np.full_like(labels, -2)
+        up_labels[1:, :] = labels[:-1, :]
 
-        # Ignore fully transparent pixels.
-        boundary &= alpha > 5
+        down_labels = np.full_like(labels, -2)
+        down_labels[:-1, :] = labels[1:, :]
 
-        # Remove tiny isolated boundaries with a local-neighbor
-        # count. This is a fast approximation of object grouping.
-        bp = np.pad(
-            boundary.astype(np.uint8),
-            ((1, 1), (1, 1)),
-            mode="constant"
-        )
+        valid = labels >= 0
 
-        neighbor_count = (
-            bp[0:h, 0:w]
-            + bp[0:h, 1:w+1]
-            + bp[0:h, 2:w+2]
-            + bp[1:h+1, 0:w]
-            + bp[1:h+1, 2:w+2]
-            + bp[2:h+2, 0:w]
-            + bp[2:h+2, 1:w+1]
-            + bp[2:h+2, 2:w+2]
-        )
+        boundary |= valid & (left_labels >= 0) & (left_labels != labels)
+        boundary |= valid & (right_labels >= 0) & (right_labels != labels)
+        boundary |= valid & (up_labels >= 0) & (up_labels != labels)
+        boundary |= valid & (down_labels >= 0) & (down_labels != labels)
 
-        boundary &= (
-            neighbor_count >=
-            min(8, max(1, min_area // 3))
-        )
-
-        # Draw the line inside the object along detected
-        # color boundaries. Repeat for configurable width.
-        for _ in range(max(1, width)):
+        # Expand the internal outline by the requested pixel width.
+        for _ in range(max(1, width) - 1):
             p = np.pad(
                 boundary,
                 ((1, 1), (1, 1)),
                 mode="constant",
                 constant_values=False
             )
-
-            expanded = (
-                p[0:-2, 0:-2]
-                | p[0:-2, 1:-1]
-                | p[0:-2, 2:]
-                | p[1:-1, 0:-2]
-                | p[1:-1, 2:]
-                | p[2:, 0:-2]
-                | p[2:, 1:-1]
-                | p[2:, 2:]
+            boundary = (
+                p[:-2, :-2] | p[:-2, 1:-1] | p[:-2, 2:] |
+                p[1:-1, :-2] | p[1:-1, 1:-1] | p[1:-1, 2:] |
+                p[2:, :-2] | p[2:, 1:-1] | p[2:, 2:]
             )
-
-            boundary |= expanded
 
         rgb[boundary] = border_color
         alpha[boundary] = 255
 
         return Image.fromarray(
-            np.dstack(
-                (rgb, alpha)
-            ).astype(np.uint8),
+            np.dstack((rgb, alpha)).astype(np.uint8),
             "RGBA"
         )
 
