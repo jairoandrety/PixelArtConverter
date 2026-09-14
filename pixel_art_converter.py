@@ -1,17 +1,65 @@
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, colorchooser
 from PIL import Image, ImageFilter, ImageEnhance, ImageTk
 import numpy as np
 from pathlib import Path
 
 
 class PixelArtConverter:
+    DEFAULTS = {
+        "width": 0,
+        "height": 256,
+        "fit_mode": "height",
+        "mode": "Pixel Art Reconstruction",
+
+        "crop": True,
+        "crop_threshold": 8,
+        "cleanup": False,
+        "contrast": 1.06,
+        "progressive": True,
+        "pixel_final": True,
+
+        "palette": 0,
+        "dither": False,
+        "alpha": False,
+
+        "clusters": True,
+        "detail": True,
+        "edges": True,
+        "silhouette": True,
+        "color_clusters": True,
+
+        "cluster_strength": 35,
+        "detail_strength": 25,
+        "edge_strength": 40,
+        "color_strength": 30,
+
+        "invert": False,
+        "monochrome": "Off",
+        "tint_r": False,
+        "tint_g": False,
+        "tint_b": False,
+        "tint_r_amount": 0,
+        "tint_g_amount": 0,
+        "tint_b_amount": 0,
+
+        "border": False,
+        "border_width": 1,
+        "border_color": "#000000",
+
+        "object_borders": False,
+        "object_border_width": 1,
+        "object_threshold": 18,
+        "object_min_area": 3,
+        "object_border_color": "#000000",
+    }
+
     def __init__(self, root):
         self.root = root
-        self.root.title("Pixel Art Converter v2.2")
-        self.root.geometry("1320x850")
-        self.root.minsize(1100, 720)
+        self.root.title("Pixel Art Converter v2.3")
+        self.root.geometry("1370x900")
+        self.root.minsize(1150, 760)
 
         self.src = None
         self.preview_source = None
@@ -19,37 +67,91 @@ class PixelArtConverter:
         self.render_job = None
 
         self.zoom = tk.DoubleVar(value=100)
-
         self.vars = {
-            "width": tk.IntVar(value=0),
-            "height": tk.IntVar(value=256),
-            "fit_mode": tk.StringVar(value="height"),
-            "mode": tk.StringVar(value="Pixel Art Reconstruction"),
-
-            "crop": tk.BooleanVar(value=True),
-            "crop_threshold": tk.IntVar(value=8),
-            "cleanup": tk.BooleanVar(value=False),
-            "contrast": tk.DoubleVar(value=1.06),
-            "progressive": tk.BooleanVar(value=True),
-            "pixel_final": tk.BooleanVar(value=True),
-
-            "palette": tk.IntVar(value=0),
-            "dither": tk.BooleanVar(value=False),
-            "alpha": tk.BooleanVar(value=False),
-
-            "clusters": tk.BooleanVar(value=True),
-            "detail": tk.BooleanVar(value=True),
-            "edges": tk.BooleanVar(value=True),
-            "silhouette": tk.BooleanVar(value=True),
-            "color_clusters": tk.BooleanVar(value=True),
-
-            "cluster_strength": tk.IntVar(value=35),
-            "detail_strength": tk.IntVar(value=25),
-            "edge_strength": tk.IntVar(value=40),
-            "color_strength": tk.IntVar(value=30),
+            key: (
+                tk.BooleanVar(value=value)
+                if isinstance(value, bool)
+                else tk.IntVar(value=value)
+                if isinstance(value, int)
+                else tk.DoubleVar(value=value)
+                if isinstance(value, float)
+                else tk.StringVar(value=value)
+            )
+            for key, value in self.DEFAULTS.items()
         }
 
         self.build_ui()
+
+    # ---------------------------------------------------------
+    # UI helpers
+    # ---------------------------------------------------------
+
+    def section(self, parent, text):
+        ttk.Label(
+            parent, text=text,
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", pady=(8, 4))
+
+    def add_scale(self, parent, label, key, minimum, maximum,
+                  integer=True, decimals=0):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(3, 0))
+
+        ttk.Label(row, text=label).pack(side="left")
+
+        value_label = ttk.Label(row, width=7, anchor="e")
+        value_label.pack(side="right")
+
+        def update_value(*_):
+            value = self.vars[key].get()
+            value_label.config(
+                text=str(int(round(value)))
+                if integer
+                else f"{float(value):.{decimals}f}"
+            )
+
+        self.vars[key].trace_add("write", update_value)
+        update_value()
+
+        ttk.Scale(
+            parent,
+            from_=minimum,
+            to=maximum,
+            variable=self.vars[key],
+            orient="horizontal",
+            command=lambda _: self.schedule_preview()
+        ).pack(fill="x")
+
+    def add_tint_control(self, parent, label, toggle_key, amount_key):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=2)
+
+        ttk.Checkbutton(
+            row,
+            text=label,
+            variable=self.vars[toggle_key],
+            command=self.schedule_preview
+        ).pack(side="left")
+
+        value = ttk.Label(row, width=6, anchor="e")
+        value.pack(side="right")
+
+        def update(*_):
+            value.config(
+                text=f"{int(round(self.vars[amount_key].get())):+d}"
+            )
+
+        self.vars[amount_key].trace_add("write", update)
+        update()
+
+        ttk.Scale(
+            parent,
+            from_=-100,
+            to=100,
+            variable=self.vars[amount_key],
+            orient="horizontal",
+            command=lambda _: self.schedule_preview()
+        ).pack(fill="x")
 
     # ---------------------------------------------------------
     # UI
@@ -62,45 +164,68 @@ class PixelArtConverter:
         right = ttk.Frame(self.root, padding=12)
         right.pack(side="right", fill="both", expand=True)
 
-        ttk.Label(left, text="PIXEL ART CONVERTER",
-                  font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(left, text="v2.2 • Stable Fast Reconstruction",
-                  foreground="#666").pack(anchor="w", pady=(0, 12))
+        ttk.Label(
+            left,
+            text="PIXEL ART CONVERTER",
+            font=("Segoe UI", 16, "bold")
+        ).pack(anchor="w")
 
-        ttk.Button(left, text="Open image...", command=self.open_image).pack(fill="x", pady=3)
-        ttk.Button(left, text="Export...", command=self.export_image).pack(fill="x", pady=3)
+        ttk.Label(
+            left,
+            text="v2.3 • Color + Object Outline Tools",
+            foreground="#666"
+        ).pack(anchor="w", pady=(0, 10))
 
-        ttk.Separator(left).pack(fill="x", pady=12)
+        ttk.Button(
+            left, text="Open image...",
+            command=self.open_image
+        ).pack(fill="x", pady=3)
 
-        ttk.Label(left, text="PROCESSING MODE",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Button(
+            left, text="Export...",
+            command=self.export_image
+        ).pack(fill="x", pady=3)
+
+        self.section(left, "PROCESSING MODE")
 
         mode = ttk.Combobox(
             left,
             textvariable=self.vars["mode"],
-            values=["Pixel Perfect Resize", "Pixel Art Reconstruction"],
+            values=[
+                "Pixel Perfect Resize",
+                "Pixel Art Reconstruction"
+            ],
             state="readonly"
         )
-        mode.pack(fill="x", pady=5)
-        mode.bind("<<ComboboxSelected>>", lambda e: self.schedule_preview())
+        mode.pack(fill="x")
+        mode.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self.schedule_preview()
+        )
 
-        ttk.Separator(left).pack(fill="x", pady=10)
+        self.section(left, "OUTPUT RESOLUTION")
 
-        ttk.Label(left, text="OUTPUT RESOLUTION",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        # Width and Height are now side-by-side.
+        resolution = ttk.Frame(left)
+        resolution.pack(fill="x", pady=3)
 
-        row = ttk.Frame(left)
-        row.pack(fill="x", pady=5)
+        ttk.Label(resolution, text="Width").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Entry(
+            resolution,
+            textvariable=self.vars["width"],
+            width=9
+        ).grid(row=0, column=1, padx=(4, 10))
 
-        ttk.Label(row, text="Width").grid(row=0, column=0, sticky="w")
-        ttk.Entry(row, textvariable=self.vars["width"], width=8).grid(
-            row=0, column=1, padx=6)
-
-        ttk.Label(row, text="Height").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(row, textvariable=self.vars["height"], width=8).grid(
-            row=1, column=1, padx=6)
-
-        ttk.Label(left, text="Resize based on").pack(anchor="w", pady=(7, 2))
+        ttk.Label(resolution, text="Height").grid(
+            row=0, column=2, sticky="w"
+        )
+        ttk.Entry(
+            resolution,
+            textvariable=self.vars["height"],
+            width=9
+        ).grid(row=0, column=3, padx=4)
 
         fit = ttk.Combobox(
             left,
@@ -108,13 +233,13 @@ class PixelArtConverter:
             values=["height", "width", "exact"],
             state="readonly"
         )
-        fit.pack(fill="x")
-        fit.bind("<<ComboboxSelected>>", lambda e: self.schedule_preview())
+        fit.pack(fill="x", pady=(5, 0))
+        fit.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self.schedule_preview()
+        )
 
-        ttk.Separator(left).pack(fill="x", pady=10)
-
-        ttk.Label(left, text="BASE PROCESSING",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.section(left, "BASE PROCESSING")
 
         ttk.Checkbutton(
             left,
@@ -124,8 +249,8 @@ class PixelArtConverter:
         ).pack(anchor="w", pady=2)
 
         self.add_scale(
-            left, "Background threshold", "crop_threshold",
-            0, 40, integer=True
+            left, "Background threshold",
+            "crop_threshold", 0, 40
         )
 
         ttk.Checkbutton(
@@ -136,8 +261,9 @@ class PixelArtConverter:
         ).pack(anchor="w", pady=2)
 
         self.add_scale(
-            left, "Contrast", "contrast",
-            0.80, 1.30, integer=False, decimals=2
+            left, "Contrast",
+            "contrast", 0.80, 1.30,
+            integer=False, decimals=2
         )
 
         ttk.Checkbutton(
@@ -154,10 +280,7 @@ class PixelArtConverter:
             command=self.schedule_preview
         ).pack(anchor="w", pady=2)
 
-        ttk.Separator(left).pack(fill="x", pady=10)
-
-        ttk.Label(left, text="PIXEL ART RECONSTRUCTION",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.section(left, "PIXEL ART RECONSTRUCTION")
 
         for text, key in [
             ("Optimize pixel clusters", "clusters"),
@@ -167,80 +290,229 @@ class PixelArtConverter:
             ("Preserve color clusters", "color_clusters"),
         ]:
             ttk.Checkbutton(
-                left, text=text, variable=self.vars[key],
+                left, text=text,
+                variable=self.vars[key],
                 command=self.schedule_preview
             ).pack(anchor="w", pady=2)
 
-        self.add_scale(left, "Cluster strength", "cluster_strength", 0, 100)
-        self.add_scale(left, "Detail simplification", "detail_strength", 0, 100)
-        self.add_scale(left, "Edge optimization", "edge_strength", 0, 100)
-        self.add_scale(left, "Color cluster strength", "color_strength", 0, 100)
+        self.add_scale(
+            left, "Cluster strength",
+            "cluster_strength", 0, 100
+        )
+        self.add_scale(
+            left, "Detail simplification",
+            "detail_strength", 0, 100
+        )
+        self.add_scale(
+            left, "Edge optimization",
+            "edge_strength", 0, 100
+        )
+        self.add_scale(
+            left, "Color cluster strength",
+            "color_strength", 0, 100
+        )
 
-        ttk.Separator(left).pack(fill="x", pady=10)
-
-        ttk.Label(left, text="COLOR",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.section(left, "COLOR")
 
         row = ttk.Frame(left)
         row.pack(fill="x", pady=3)
 
-        ttk.Label(row, text="Palette (0 = original)").pack(side="left")
+        ttk.Label(
+            row, text="Palette (0 = original)"
+        ).pack(side="left")
 
-        palette = ttk.Spinbox(
-            row, from_=0, to=256,
+        ttk.Spinbox(
+            row,
+            from_=0,
+            to=256,
             textvariable=self.vars["palette"],
             width=7,
             command=self.schedule_preview
-        )
-        palette.pack(side="right")
+        ).pack(side="right")
 
         ttk.Checkbutton(
-            left, text="Controlled dithering",
+            left,
+            text="Invert colors",
+            variable=self.vars["invert"],
+            command=self.schedule_preview
+        ).pack(anchor="w", pady=2)
+
+        mono = ttk.Combobox(
+            left,
+            textvariable=self.vars["monochrome"],
+            values=["Off", "Black", "White"],
+            state="readonly"
+        )
+        mono.pack(fill="x", pady=2)
+        mono.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self.schedule_preview()
+        )
+
+        ttk.Label(
+            left,
+            text="RGB Tints",
+            font=("Segoe UI", 9, "bold")
+        ).pack(anchor="w", pady=(5, 0))
+
+        self.add_tint_control(
+            left, "Red",
+            "tint_r", "tint_r_amount"
+        )
+        self.add_tint_control(
+            left, "Green",
+            "tint_g", "tint_g_amount"
+        )
+        self.add_tint_control(
+            left, "Blue",
+            "tint_b", "tint_b_amount"
+        )
+
+        ttk.Checkbutton(
+            left,
+            text="Controlled dithering",
             variable=self.vars["dither"],
             command=self.schedule_preview
         ).pack(anchor="w", pady=2)
 
         ttk.Checkbutton(
-            left, text="Transparent background",
+            left,
+            text="Transparent background",
             variable=self.vars["alpha"],
             command=self.schedule_preview
         ).pack(anchor="w", pady=2)
 
-        ttk.Separator(left).pack(fill="x", pady=10)
+        self.section(left, "OUTLINE")
 
-        ttk.Button(left, text="Reset settings",
-                   command=self.reset).pack(fill="x", pady=3)
+        ttk.Checkbutton(
+            left,
+            text="Add outer border",
+            variable=self.vars["border"],
+            command=self.schedule_preview
+        ).pack(anchor="w", pady=2)
+
+        self.add_scale(
+            left, "Border width",
+            "border_width", 1, 10
+        )
+
+        border_row = ttk.Frame(left)
+        border_row.pack(fill="x", pady=3)
+
+        ttk.Label(border_row, text="Border color").pack(side="left")
+
+        self.border_color_preview = tk.Label(
+            border_row,
+            text="  ",
+            width=4,
+            bg=self.vars["border_color"].get(),
+            relief="solid",
+            borderwidth=1
+        )
+        self.border_color_preview.pack(side="right")
+
+        ttk.Button(
+            border_row,
+            text="Choose",
+            command=self.choose_border_color
+        ).pack(side="right", padx=5)
+
+        ttk.Checkbutton(
+            left,
+            text="Detect objects and outline internal regions",
+            variable=self.vars["object_borders"],
+            command=self.schedule_preview
+        ).pack(anchor="w", pady=2)
+
+        self.add_scale(
+            left, "Object border width",
+            "object_border_width", 1, 6
+        )
+
+        self.add_scale(
+            left, "Color group threshold",
+            "object_threshold", 1, 60
+        )
+
+        self.add_scale(
+            left, "Minimum object area",
+            "object_min_area", 1, 100
+        )
+
+        obj_row = ttk.Frame(left)
+        obj_row.pack(fill="x", pady=3)
+
+        ttk.Label(
+            obj_row,
+            text="Object border color"
+        ).pack(side="left")
+
+        self.object_color_preview = tk.Label(
+            obj_row,
+            text="  ",
+            width=4,
+            bg=self.vars["object_border_color"].get(),
+            relief="solid",
+            borderwidth=1
+        )
+        self.object_color_preview.pack(side="right")
+
+        ttk.Button(
+            obj_row,
+            text="Choose",
+            command=self.choose_object_color
+        ).pack(side="right", padx=5)
+
+        ttk.Separator(left).pack(fill="x", pady=8)
+
+        # Explicit reset button.
+        ttk.Button(
+            left,
+            text="RESET TO DEFAULTS",
+            command=self.reset
+        ).pack(fill="x", pady=3)
 
         ttk.Label(
             left,
-            text="Recommended: Reconstruction + Palette 0 + Dither OFF.",
-            wraplength=280,
+            text=(
+                "Recommended for 256 px buildings: "
+                "Reconstruction, Palette 0, Dither OFF."
+            ),
+            wraplength=300,
             foreground="#555"
-        ).pack(anchor="w", pady=8)
+        ).pack(anchor="w", pady=7)
 
         # -----------------------------------------------------
         # Preview
         # -----------------------------------------------------
 
-        ttk.Label(right, text="PREVIEW",
-                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(
+            right,
+            text="PREVIEW",
+            font=("Segoe UI", 11, "bold")
+        ).pack(anchor="w")
 
         zoom_row = ttk.Frame(right)
         zoom_row.pack(fill="x", pady=(5, 8))
 
         ttk.Button(
-            zoom_row, text="Fit",
+            zoom_row,
+            text="Fit",
             command=self.fit_zoom,
             width=7
         ).pack(side="left")
 
         ttk.Button(
-            zoom_row, text="100%",
+            zoom_row,
+            text="100%",
             command=lambda: self.set_zoom(100),
             width=7
         ).pack(side="left", padx=4)
 
-        ttk.Label(zoom_row, text="Zoom").pack(side="left", padx=(12, 4))
+        ttk.Label(
+            zoom_row,
+            text="Zoom"
+        ).pack(side="left", padx=(12, 4))
 
         ttk.Scale(
             zoom_row,
@@ -252,7 +524,10 @@ class PixelArtConverter:
         ).pack(side="left", fill="x", expand=True)
 
         self.zoom_value = ttk.Label(
-            zoom_row, text="100%", width=7, anchor="e"
+            zoom_row,
+            text="100%",
+            width=7,
+            anchor="e"
         )
         self.zoom_value.pack(side="left", padx=(6, 0))
 
@@ -264,7 +539,11 @@ class PixelArtConverter:
             bg="#202020",
             highlightthickness=0
         )
-        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
 
         self.vbar = ttk.Scrollbar(
             canvas_frame,
@@ -290,94 +569,71 @@ class PixelArtConverter:
             text="Open an image to begin.",
             anchor="w"
         )
-        self.status.pack(fill="x", pady=(8, 0))
+        self.status.pack(
+            fill="x",
+            pady=(8, 0)
+        )
 
         self.canvas.bind(
             "<Configure>",
             lambda e: self.render_preview_image()
         )
-
-        self.canvas.bind("<MouseWheel>", self.mouse_wheel_zoom)
-        self.canvas.bind("<Button-4>", self.mouse_wheel_zoom)
-        self.canvas.bind("<Button-5>", self.mouse_wheel_zoom)
-
-    def add_scale(
-        self, parent, label, key,
-        minimum, maximum,
-        integer=True, decimals=0
-    ):
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(3, 0))
-
-        ttk.Label(row, text=label).pack(side="left")
-
-        value_label = ttk.Label(
-            row, width=7, anchor="e"
+        self.canvas.bind(
+            "<MouseWheel>",
+            self.mouse_wheel_zoom
         )
-        value_label.pack(side="right")
-
-        def update_value(*_):
-            value = self.vars[key].get()
-
-            if integer:
-                value_label.config(
-                    text=str(int(round(value)))
-                )
-            else:
-                value_label.config(
-                    text=f"{float(value):.{decimals}f}"
-                )
-
-        self.vars[key].trace_add("write", update_value)
-        update_value()
-
-        ttk.Scale(
-            parent,
-            from_=minimum,
-            to=maximum,
-            variable=self.vars[key],
-            orient="horizontal",
-            command=lambda _: self.schedule_preview()
-        ).pack(fill="x")
+        self.canvas.bind(
+            "<Button-4>",
+            self.mouse_wheel_zoom
+        )
+        self.canvas.bind(
+            "<Button-5>",
+            self.mouse_wheel_zoom
+        )
 
     # ---------------------------------------------------------
-    # Settings
+    # Colors
+    # ---------------------------------------------------------
+
+    def choose_border_color(self):
+        color = colorchooser.askcolor(
+            initialcolor=self.vars["border_color"].get(),
+            title="Choose outer border color"
+        )[1]
+
+        if color:
+            self.vars["border_color"].set(color)
+            self.border_color_preview.config(bg=color)
+            self.schedule_preview()
+
+    def choose_object_color(self):
+        color = colorchooser.askcolor(
+            initialcolor=self.vars["object_border_color"].get(),
+            title="Choose object border color"
+        )[1]
+
+        if color:
+            self.vars["object_border_color"].set(color)
+            self.object_color_preview.config(bg=color)
+            self.schedule_preview()
+
+    # ---------------------------------------------------------
+    # Reset
     # ---------------------------------------------------------
 
     def reset(self):
-        defaults = {
-            "width": 0,
-            "height": 256,
-            "fit_mode": "height",
-            "mode": "Pixel Art Reconstruction",
-
-            "crop": True,
-            "crop_threshold": 8,
-            "cleanup": False,
-            "contrast": 1.06,
-            "progressive": True,
-            "pixel_final": True,
-
-            "palette": 0,
-            "dither": False,
-            "alpha": False,
-
-            "clusters": True,
-            "detail": True,
-            "edges": True,
-            "silhouette": True,
-            "color_clusters": True,
-
-            "cluster_strength": 35,
-            "detail_strength": 25,
-            "edge_strength": 40,
-            "color_strength": 30,
-        }
-
-        for key, value in defaults.items():
+        for key, value in self.DEFAULTS.items():
             self.vars[key].set(value)
 
         self.zoom.set(100)
+
+        self.border_color_preview.config(
+            bg=self.vars["border_color"].get()
+        )
+        self.object_color_preview.config(
+            bg=self.vars["object_border_color"].get()
+        )
+
         self.schedule_preview()
 
     # ---------------------------------------------------------
@@ -392,14 +648,23 @@ class PixelArtConverter:
         if self.preview_source is None:
             return
 
-        cw = max(1, self.canvas.winfo_width() - 20)
-        ch = max(1, self.canvas.winfo_height() - 20)
+        cw = max(
+            1,
+            self.canvas.winfo_width() - 20
+        )
+        ch = max(
+            1,
+            self.canvas.winfo_height() - 20
+        )
 
         zw = cw / self.preview_source.width * 100
         zh = ch / self.preview_source.height * 100
 
         value = min(zw, zh)
-        value = max(25, min(800, value))
+        value = max(
+            25,
+            min(800, value)
+        )
 
         self.zoom.set(value)
         self.render_preview_image()
@@ -413,13 +678,23 @@ class PixelArtConverter:
         if ctrl or event.num in (4, 5):
             current = float(self.zoom.get())
 
-            if getattr(event, "delta", 0) > 0 or event.num == 4:
-                new = min(800, current * 1.15)
+            if (
+                getattr(event, "delta", 0) > 0
+                or event.num == 4
+            ):
+                new = min(
+                    800,
+                    current * 1.15
+                )
             else:
-                new = max(25, current / 1.15)
+                new = max(
+                    25,
+                    current / 1.15
+                )
 
             self.zoom.set(new)
             self.render_preview_image()
+
             return "break"
 
         return None
@@ -433,11 +708,15 @@ class PixelArtConverter:
 
             w = max(
                 1,
-                int(round(self.preview_source.width * scale))
+                int(round(
+                    self.preview_source.width * scale
+                ))
             )
             h = max(
                 1,
-                int(round(self.preview_source.height * scale))
+                int(round(
+                    self.preview_source.height * scale
+                ))
             )
 
             preview = self.preview_source.resize(
@@ -445,18 +724,25 @@ class PixelArtConverter:
                 Image.Resampling.NEAREST
             )
 
-            self.preview_img = ImageTk.PhotoImage(preview)
+            self.preview_img = ImageTk.PhotoImage(
+                preview
+            )
 
             self.canvas.delete("all")
 
             self.canvas.create_image(
-                10, 10,
+                10,
+                10,
                 image=self.preview_img,
                 anchor="nw"
             )
 
             self.canvas.configure(
-                scrollregion=(0, 0, w + 20, h + 20)
+                scrollregion=(
+                    0, 0,
+                    w + 20,
+                    h + 20
+                )
             )
 
             self.zoom_value.config(
@@ -469,7 +755,7 @@ class PixelArtConverter:
             )
 
     # ---------------------------------------------------------
-    # Image handling
+    # Open / crop / resize
     # ---------------------------------------------------------
 
     def open_image(self):
@@ -477,7 +763,8 @@ class PixelArtConverter:
             filetypes=[
                 (
                     "Images",
-                    "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"
+                    "*.png *.jpg *.jpeg *.bmp "
+                    "*.webp *.tif *.tiff"
                 ),
                 ("All files", "*.*")
             ]
@@ -487,7 +774,9 @@ class PixelArtConverter:
             return
 
         try:
-            self.src = Image.open(path).convert("RGBA")
+            self.src = Image.open(
+                path
+            ).convert("RGBA")
 
             self.status.config(
                 text=(
@@ -507,13 +796,21 @@ class PixelArtConverter:
     def crop_empty(self, img):
         rgba = np.asarray(img)
 
-        rgb = rgba[:, :, :3].astype(np.int16)
-
-        threshold = int(
-            round(self.vars["crop_threshold"].get())
+        rgb = rgba[:, :, :3].astype(
+            np.int16
         )
 
-        mask = np.max(rgb, axis=2) > threshold
+        threshold = int(
+            round(
+                self.vars["crop_threshold"].get()
+            )
+        )
+
+        mask = np.max(
+            rgb,
+            axis=2
+        ) > threshold
+
         mask &= rgba[:, :, 3] > 5
 
         ys, xs = np.where(mask)
@@ -522,10 +819,22 @@ class PixelArtConverter:
             return img
 
         return img.crop((
-            max(0, int(xs.min()) - 1),
-            max(0, int(ys.min()) - 1),
-            min(img.width, int(xs.max()) + 2),
-            min(img.height, int(ys.max()) + 2)
+            max(
+                0,
+                int(xs.min()) - 1
+            ),
+            max(
+                0,
+                int(ys.min()) - 1
+            ),
+            min(
+                img.width,
+                int(xs.max()) + 2
+            ),
+            min(
+                img.height,
+                int(ys.max()) + 2
+            )
         ))
 
     def calculate_target(self, img):
@@ -539,12 +848,13 @@ class PixelArtConverter:
 
         if mode == "width":
             tw = max(1, tw)
-
             return (
                 tw,
                 max(
                     1,
-                    round(img.height * tw / img.width)
+                    round(
+                        img.height * tw / img.width
+                    )
                 )
             )
 
@@ -553,7 +863,9 @@ class PixelArtConverter:
         return (
             max(
                 1,
-                round(img.width * th / img.height)
+                round(
+                    img.width * th / img.height
+                )
             ),
             th
         )
@@ -564,18 +876,24 @@ class PixelArtConverter:
 
         current = img
 
-        for height in (768, 512, 384, 320):
+        for height in (
+            768, 512, 384, 320
+        ):
             if (
                 current.height > height
                 and height > target[1]
             ):
-                scale = height / current.height
+                scale = (
+                    height / current.height
+                )
 
                 current = current.resize(
                     (
                         max(
                             1,
-                            round(current.width * scale)
+                            round(
+                                current.width * scale
+                            )
                         ),
                         height
                     ),
@@ -585,17 +903,10 @@ class PixelArtConverter:
         return current
 
     # ---------------------------------------------------------
-    # Stable vectorized reconstruction
+    # Pixel-art reconstruction
     # ---------------------------------------------------------
 
     def reconstruct_pixel_art(self, img):
-        """
-        Stable reconstruction pass.
-
-        All operations preserve exactly H x W dimensions.
-        No Python loop over individual pixels.
-        """
-
         rgba = np.asarray(
             img.convert("RGBA"),
             dtype=np.float32
@@ -609,24 +920,20 @@ class PixelArtConverter:
         if h < 3 or w < 3:
             return img
 
-        # -----------------------------------------------------
-        # Color clusters
-        # -----------------------------------------------------
-
-        color_strength = (
-            float(self.vars["color_strength"].get())
-            / 100.0
+        # Color cluster preservation.
+        cs = (
+            float(
+                self.vars["color_strength"].get()
+            ) / 100.0
         )
 
         if (
             self.vars["color_clusters"].get()
-            and color_strength > 0
+            and cs > 0
         ):
-            # Mild quantization. It deliberately does not
-            # collapse the image to a tiny global palette.
             step = max(
                 1.0,
-                1.0 + color_strength * 8.0
+                1.0 + cs * 8.0
             )
 
             quantized = (
@@ -634,13 +941,9 @@ class PixelArtConverter:
             )
 
             rgb = (
-                rgb * (1.0 - color_strength * 0.15)
-                + quantized * (color_strength * 0.15)
+                rgb * (1.0 - cs * 0.15)
+                + quantized * (cs * 0.15)
             )
-
-        # -----------------------------------------------------
-        # 3x3 neighborhood
-        # -----------------------------------------------------
 
         padded = np.pad(
             rgb,
@@ -672,13 +975,10 @@ class PixelArtConverter:
             axis=2
         )
 
-        # -----------------------------------------------------
-        # Cluster optimization
-        # -----------------------------------------------------
-
         cluster_strength = (
-            float(self.vars["cluster_strength"].get())
-            / 100.0
+            float(
+                self.vars["cluster_strength"].get()
+            ) / 100.0
         )
 
         if (
@@ -691,51 +991,45 @@ class PixelArtConverter:
                 1.0
             )
 
-            amount *= cluster_strength * 0.18
+            amount *= (
+                cluster_strength * 0.18
+            )
 
             rgb = (
                 rgb * (1.0 - amount[:, :, None])
                 + median * amount[:, :, None]
             )
 
-        # -----------------------------------------------------
-        # Detail simplification
-        # -----------------------------------------------------
-
         detail_strength = (
-            float(self.vars["detail_strength"].get())
-            / 100.0
+            float(
+                self.vars["detail_strength"].get()
+            ) / 100.0
         )
 
         if (
             self.vars["detail"].get()
             and detail_strength > 0
         ):
-            # Only remove very small color fluctuations.
             amount = np.clip(
                 (18.0 - distance) / 18.0,
                 0.0,
                 1.0
             )
 
-            amount *= detail_strength * 0.10
+            amount *= (
+                detail_strength * 0.10
+            )
 
             rgb = (
                 rgb * (1.0 - amount[:, :, None])
                 + median * amount[:, :, None]
             )
 
-        # -----------------------------------------------------
-        # Edge optimization
-        #
-        # IMPORTANT:
-        # Everything stays H x W.
-        # No interior/whole-image broadcasting mismatch.
-        # -----------------------------------------------------
-
+        # Stable H x W edge optimization.
         edge_strength = (
-            float(self.vars["edge_strength"].get())
-            / 100.0
+            float(
+                self.vars["edge_strength"].get()
+            ) / 100.0
         )
 
         if (
@@ -747,80 +1041,65 @@ class PixelArtConverter:
             up = padded[0:h, 1:w+1]
             down = padded[2:h+2, 1:w+1]
 
-            horizontal_difference = np.linalg.norm(
+            hd = np.linalg.norm(
                 left - right,
                 axis=2
             )
-
-            vertical_difference = np.linalg.norm(
+            vd = np.linalg.norm(
                 up - down,
                 axis=2
             )
 
-            edge_map = np.maximum(
-                horizontal_difference,
-                vertical_difference
+            dl = np.linalg.norm(
+                rgb - left,
+                axis=2
+            )
+            dr = np.linalg.norm(
+                rgb - right,
+                axis=2
+            )
+            du = np.linalg.norm(
+                rgb - up,
+                axis=2
+            )
+            dd = np.linalg.norm(
+                rgb - down,
+                axis=2
             )
 
             horizontal_target = np.where(
-                (
-                    np.linalg.norm(
-                        rgb - left,
-                        axis=2
-                    )
-                    <
-                    np.linalg.norm(
-                        rgb - right,
-                        axis=2
-                    )
-                )[:, :, None],
+                (dl < dr)[:, :, None],
                 left,
                 right
             )
 
             vertical_target = np.where(
-                (
-                    np.linalg.norm(
-                        rgb - up,
-                        axis=2
-                    )
-                    <
-                    np.linalg.norm(
-                        rgb - down,
-                        axis=2
-                    )
-                )[:, :, None],
+                (du < dd)[:, :, None],
                 up,
                 down
             )
 
             target = np.where(
-                (
-                    horizontal_difference
-                    >= vertical_difference
-                )[:, :, None],
+                (hd >= vd)[:, :, None],
                 horizontal_target,
                 vertical_target
             )
 
-            # Only affect strong edges.
             edge_amount = np.clip(
-                (edge_map - 55.0) / 100.0,
+                (np.maximum(hd, vd) - 55.0)
+                / 100.0,
                 0.0,
                 1.0
             )
 
-            edge_amount *= edge_strength * 0.06
+            edge_amount *= (
+                edge_strength * 0.06
+            )
 
             rgb = (
                 rgb * (1.0 - edge_amount[:, :, None])
                 + target * edge_amount[:, :, None]
             )
-
-        # -----------------------------------------------------
-        # Preserve silhouette:
-        # alpha is never changed.
-        # -----------------------------------------------------
 
         rgb = np.clip(
             np.round(rgb),
@@ -843,7 +1122,302 @@ class PixelArtConverter:
         return result
 
     # ---------------------------------------------------------
-    # Pipeline
+    # Color effects
+    # ---------------------------------------------------------
+
+    def apply_color_effects(self, img):
+        rgba = np.asarray(
+            img.convert("RGBA"),
+            dtype=np.float32
+        )
+
+        rgb = rgba[:, :, :3]
+        alpha = rgba[:, :, 3]
+
+        if self.vars["invert"].get():
+            rgb = 255.0 - rgb
+
+        mono = self.vars["monochrome"].get()
+
+        if mono != "Off":
+            luminance = (
+                0.299 * rgb[:, :, 0]
+                + 0.587 * rgb[:, :, 1]
+                + 0.114 * rgb[:, :, 2]
+            )
+
+            if mono == "Black":
+                # Black-and-white using luminance.
+                # Black remains black; bright areas become white.
+                rgb = np.repeat(
+                    luminance[:, :, None],
+                    3,
+                    axis=2
+                )
+
+            elif mono == "White":
+                # White monochrome: brightness is represented
+                # as white with variable intensity.
+                rgb = np.repeat(
+                    luminance[:, :, None],
+                    3,
+                    axis=2
+                )
+
+        # RGB tint controls.
+        # Each enabled component adds/subtracts from its channel.
+        for enabled_key, amount_key, channel in [
+            ("tint_r", "tint_r_amount", 0),
+            ("tint_g", "tint_g_amount", 1),
+            ("tint_b", "tint_b_amount", 2),
+        ]:
+            if self.vars[enabled_key].get():
+                amount = float(
+                    self.vars[amount_key].get()
+                )
+
+                rgb[:, :, channel] = np.clip(
+                    rgb[:, :, channel] + amount,
+                    0,
+                    255
+                )
+
+        rgb = np.clip(
+            np.round(rgb),
+            0,
+            255
+        ).astype(np.uint8)
+
+        result = Image.fromarray(
+            rgb,
+            "RGB"
+        ).convert("RGBA")
+
+        result.putalpha(
+            Image.fromarray(
+                alpha.astype(np.uint8),
+                "L"
+            )
+        )
+
+        return result
+
+    # ---------------------------------------------------------
+    # Outer border
+    # ---------------------------------------------------------
+
+    def add_outer_border(self, img):
+        if not self.vars["border"].get():
+            return img
+
+        rgba = np.asarray(
+            img.convert("RGBA")
+        )
+
+        rgb = rgba[:, :, :3]
+        alpha = rgba[:, :, 3]
+
+        width = int(
+            round(
+                self.vars["border_width"].get()
+            )
+        )
+
+        color = self.hex_to_rgb(
+            self.vars["border_color"].get()
+        )
+
+        # Border follows visible content/alpha.
+        visible = alpha > 5
+
+        # A border is created around the silhouette.
+        for _ in range(max(1, width)):
+            p = np.pad(
+                visible,
+                ((1, 1), (1, 1)),
+                mode="constant",
+                constant_values=False
+            )
+
+            expanded = (
+                p[0:-2, 0:-2]
+                | p[0:-2, 1:-1]
+                | p[0:-2, 2:]
+                | p[1:-1, 0:-2]
+                | p[1:-1, 2:]
+                | p[2:, 0:-2]
+                | p[2:, 1:-1]
+                | p[2:, 2:]
+            )
+
+            border_mask = expanded & ~visible
+
+            # Keep original pixels untouched.
+            rgb[border_mask] = color
+            alpha[border_mask] = 255
+            visible |= border_mask
+
+        result = Image.fromarray(
+            np.dstack((rgb, alpha)).astype(np.uint8),
+            "RGBA"
+        )
+
+        return result
+
+    # ---------------------------------------------------------
+    # Object detection / internal outlines
+    # ---------------------------------------------------------
+
+    def add_object_borders(self, img):
+        if not self.vars["object_borders"].get():
+            return img
+
+        rgba = np.asarray(
+            img.convert("RGBA")
+        )
+
+        rgb = rgba[:, :, :3].astype(
+            np.int16
+        )
+        alpha = rgba[:, :, 3]
+
+        h, w = rgb.shape[:2]
+
+        if h < 2 or w < 2:
+            return img
+
+        threshold = int(
+            round(
+                self.vars["object_threshold"].get()
+            )
+        )
+
+        width = int(
+            round(
+                self.vars["object_border_width"].get()
+            )
+        )
+
+        min_area = int(
+            round(
+                self.vars["object_min_area"].get()
+            )
+        )
+
+        border_color = self.hex_to_rgb(
+            self.vars["object_border_color"].get()
+        )
+
+        # Detect color-group boundaries. Instead of expensive
+        # flood-fill for every pixel, compare neighboring colors.
+        left = np.pad(
+            rgb[:, :-1],
+            ((0, 0), (1, 0), (0, 0)),
+            mode="edge"
+        )
+
+        up = np.pad(
+            rgb[:-1, :],
+            ((1, 0), (0, 0), (0, 0)),
+            mode="edge"
+        )
+
+        horizontal_diff = np.linalg.norm(
+            rgb - left,
+            axis=2
+        )
+
+        vertical_diff = np.linalg.norm(
+            rgb - up,
+            axis=2
+        )
+
+        boundary = (
+            (horizontal_diff >= threshold)
+            | (vertical_diff >= threshold)
+        )
+
+        # Ignore fully transparent pixels.
+        boundary &= alpha > 5
+
+        # Remove tiny isolated boundaries with a local-neighbor
+        # count. This is a fast approximation of object grouping.
+        bp = np.pad(
+            boundary.astype(np.uint8),
+            ((1, 1), (1, 1)),
+            mode="constant"
+        )
+
+        neighbor_count = (
+            bp[0:h, 0:w]
+            + bp[0:h, 1:w+1]
+            + bp[0:h, 2:w+2]
+            + bp[1:h+1, 0:w]
+            + bp[1:h+1, 2:w+2]
+            + bp[2:h+2, 0:w]
+            + bp[2:h+2, 1:w+1]
+            + bp[2:h+2, 2:w+2]
+        )
+
+        boundary &= (
+            neighbor_count >=
+            min(8, max(1, min_area // 3))
+        )
+
+        # Draw the line inside the object along detected
+        # color boundaries. Repeat for configurable width.
+        for _ in range(max(1, width)):
+            p = np.pad(
+                boundary,
+                ((1, 1), (1, 1)),
+                mode="constant",
+                constant_values=False
+            )
+
+            expanded = (
+                p[0:-2, 0:-2]
+                | p[0:-2, 1:-1]
+                | p[0:-2, 2:]
+                | p[1:-1, 0:-2]
+                | p[1:-1, 2:]
+                | p[2:, 0:-2]
+                | p[2:, 1:-1]
+                | p[2:, 2:]
+            )
+
+            boundary |= expanded
+
+        rgb[boundary] = border_color
+        alpha[boundary] = 255
+
+        return Image.fromarray(
+            np.dstack(
+                (rgb, alpha)
+            ).astype(np.uint8),
+            "RGBA"
+        )
+
+    @staticmethod
+    def hex_to_rgb(value):
+        value = value.lstrip("#")
+
+        if len(value) != 6:
+            return np.array(
+                [0, 0, 0],
+                dtype=np.uint8
+            )
+
+        return np.array(
+            [
+                int(value[0:2], 16),
+                int(value[2:4], 16),
+                int(value[4:6], 16)
+            ],
+            dtype=np.uint8
+        )
+
+    # ---------------------------------------------------------
+    # Full pipeline
     # ---------------------------------------------------------
 
     def process(self):
@@ -911,7 +1485,11 @@ class PixelArtConverter:
             self.vars["mode"].get()
             == "Pixel Art Reconstruction"
         ):
-            img = self.reconstruct_pixel_art(img)
+            img = self.reconstruct_pixel_art(
+                img
+            )
+
+        img = self.apply_color_effects(img)
 
         colors = int(
             self.vars["palette"].get()
@@ -945,17 +1523,41 @@ class PixelArtConverter:
                 )
             )
 
+        img = self.add_outer_border(
+            img
+        )
+
+        img = self.add_object_borders(
+            img
+        )
+
         if self.vars["alpha"].get():
             return img.convert("RGBA")
 
-        return img.convert("RGB")
+        # If transparency is disabled, flatten transparent
+        # pixels to black instead of producing accidental
+        # alpha artifacts.
+        background = Image.new(
+            "RGB",
+            img.size,
+            (0, 0, 0)
+        )
+        background.paste(
+            img,
+            mask=img.getchannel("A")
+        )
+
+        return background
+
+    # ---------------------------------------------------------
+    # Preview / export
+    # ---------------------------------------------------------
 
     def render_preview(self):
         self.render_job = None
 
         if self.src is None:
             self.canvas.delete("all")
-
             self.canvas.create_text(
                 400,
                 300,
@@ -963,7 +1565,6 @@ class PixelArtConverter:
                 fill="white",
                 font=("Segoe UI", 18)
             )
-
             return
 
         try:
@@ -995,8 +1596,6 @@ class PixelArtConverter:
             except Exception:
                 pass
 
-        # Small debounce prevents the processor from
-        # running dozens of times while dragging a slider.
         self.render_job = self.root.after(
             100,
             self.render_preview
@@ -1025,7 +1624,9 @@ class PixelArtConverter:
         try:
             img = self.process()
 
-            ext = Path(path).suffix.lower()
+            ext = Path(
+                path
+            ).suffix.lower()
 
             if ext in (".jpg", ".jpeg"):
                 img.convert("RGB").save(

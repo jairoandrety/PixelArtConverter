@@ -1,5 +1,5 @@
 
-# Pixel Art Converter v2.2
+# Pixel Art Converter v2.3
 
 Desktop utility for converting illustrations into crisp pixel-art assets.
 
@@ -19,11 +19,26 @@ Desktop utility for converting illustrations into crisp pixel-art assets.
 - Adjusts contrast, cleans isolated noise, and preserves the original alpha channel exactly.
 - Includes reconstruction controls for clusters, details, edges, silhouette, and color.
 - Optionally reduces the palette to 2–256 colors, with optional dithering.
+- Includes invert, monochrome, and independent red, green, and blue tint controls.
+- Provides configurable outer borders with a selectable width and color.
+- Provides internal color-group outline controls with a selectable width, threshold,
+  minimum-area setting, and color.
 - Shows the current numeric value beside every processing slider.
 - Provides a crisp nearest-neighbor preview with 25%–800% zoom.
 - Includes **Fit** and **100%** preview buttons, Ctrl + mouse-wheel zoom, and scrollbars
   for enlarged previews.
 - Exports PNG, WebP, and JPEG.
+
+## Color and outline tools
+
+- **Invert colors:** reverses every RGB channel while retaining alpha.
+- **Monochrome:** offers Black and White monochrome modes.
+- **RGB tints:** independently enable and adjust red, green, and blue channels from
+  `-100` to `100`.
+- **Outer border:** adds a selectable border around the visible alpha silhouette.
+- **Internal object borders:** uses a fast color-group boundary approximation intended
+  for pixel art. It compares neighboring color changes and avoids costly per-pixel
+  flood-fill segmentation.
 
 ## Installation and running
 
