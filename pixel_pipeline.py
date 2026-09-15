@@ -61,12 +61,17 @@ class Settings:
     object_min_area: int = 3
     object_border_color: str = "#000000"
     noise_cleanup: bool = False
+    noise_method: str = "Local dominant color"
+    noise_window: int = 3
+    noise_min_isolation: int = 1
     noise_strength: int = 30
     noise_tolerance: int = 20
     noise_group_tolerance: int = 2
     noise_max_area: int = 12
     noise_protect: bool = True
     local_effects: bool = False
+    average_blend: int = 0
+    average_source: str = "Selection"
 
     @classmethod
     def from_mapping(cls, data):
@@ -88,7 +93,8 @@ class Settings:
 class Pipeline:
     """Stateless-per-run image pipeline."""
 
-    def __init__(self, settings, mask=None):
+    def __init__(self, settings, mask=None, class_colors=None,
+                 class_overrides=None):
         """
         ``mask`` is an optional boolean array in output coordinates.
 
@@ -97,8 +103,19 @@ class Pipeline:
         """
         self.settings = settings
         self.mask = mask
+        # Detected class centers plus the replacement colors chosen for
+        # some of them. Pixels are matched to a center at render time,
+        # so a recolor survives changes to the other settings instead of
+        # being a one-off edit to a rendered image.
+        self.class_colors = (
+            None if class_colors is None
+            else np.asarray(class_colors, dtype=np.float64)
+        )
+        self.class_overrides = dict(class_overrides or {})
         self.outer_border_clipped = False
         self.noise_pixels_changed = 0
+        self.recolored_pixels = 0
+        self.average_blended_pixels = 0
 
     def restrict(self, before, after):
         """
@@ -564,6 +581,172 @@ class Pipeline:
         return result
 
     # ---------------------------------------------------------
+    # Element detection
+    # ---------------------------------------------------------
+
+    # Pixels compared against centers in one go; chunking keeps the
+    # distance matrix bounded on large outputs.
+    ASSIGN_CHUNK = 65536
+
+    @staticmethod
+    def assign_classes(pixels, centers):
+        """Nearest center for every pixel, in bounded chunks."""
+        out = np.empty(len(pixels), dtype=np.int32)
+
+        for start in range(0, len(pixels), Pipeline.ASSIGN_CHUNK):
+            block = pixels[start:start + Pipeline.ASSIGN_CHUNK]
+            distances = (
+                (block[:, None, :] - centers[None, :, :]) ** 2
+            ).sum(axis=2)
+            out[start:start + len(block)] = distances.argmin(axis=1)
+
+        return out
+
+    @staticmethod
+    def cluster_colors(rgb, alpha, classes, sample_size=6000,
+                       iterations=20, seed=0):
+        """
+        Group visible pixels into color classes with k-means.
+
+        A class is a material rather than an object: lit brick, shaded
+        brick, glass, foliage, balcony slab. Clustering runs on RGB
+        because dropping luminance was measured to be worse here --
+        value is most of what separates glass from render from stone in
+        pixel art.
+
+        The seed is fixed so a preview does not change between renders,
+        and the fit runs on a subsample so cost does not grow with the
+        image.
+        """
+        height, width = rgb.shape[:2]
+        labels = np.full((height, width), -1, dtype=np.int32)
+        visible = alpha > 5
+
+        if not visible.any() or classes < 1:
+            return labels, np.zeros((0, 3), dtype=np.uint8)
+
+        pixels = rgb[visible].astype(np.float64)
+        distinct = np.unique(pixels, axis=0)
+        classes = max(1, min(int(classes), len(distinct)))
+
+        rng = np.random.default_rng(seed)
+
+        if len(pixels) > sample_size:
+            sample = pixels[
+                rng.choice(len(pixels), sample_size, replace=False)
+            ]
+        else:
+            sample = pixels
+
+        # k-means++ seeding, so the result does not depend on luck.
+        centers = np.empty((classes, 3), dtype=np.float64)
+        centers[0] = sample[rng.integers(len(sample))]
+        closest = ((sample - centers[0]) ** 2).sum(axis=1)
+
+        for index in range(1, classes):
+            total = float(closest.sum())
+
+            if total <= 0:
+                centers[index] = sample[rng.integers(len(sample))]
+            else:
+                centers[index] = sample[
+                    rng.choice(len(sample), p=closest / total)
+                ]
+
+            closest = np.minimum(
+                closest, ((sample - centers[index]) ** 2).sum(axis=1)
+            )
+
+        for _ in range(iterations):
+            assignment = Pipeline.assign_classes(sample, centers)
+            moved = False
+
+            for index in range(classes):
+                members = sample[assignment == index]
+
+                if not len(members):
+                    continue
+
+                updated = members.mean(axis=0)
+
+                if not np.allclose(updated, centers[index]):
+                    moved = True
+
+                centers[index] = updated
+
+            if not moved:
+                break
+
+        labels[visible] = Pipeline.assign_classes(pixels, centers)
+
+        return labels, np.clip(np.rint(centers), 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def class_instances(mask, min_area=1):
+        """
+        Connected components of one class mask.
+
+        A class is the material; an instance is one object of it, such
+        as a single window within the glass class. This reuses the same
+        run-based segmentation the outlines use by handing it a uniform
+        color, so only connectivity decides the result.
+        """
+        height, width = mask.shape
+        uniform = np.zeros((height, width, 3), dtype=np.uint8)
+        alpha = np.where(mask, 255, 0).astype(np.uint8)
+
+        return Pipeline.segment_color_regions(uniform, alpha, 0, min_area)
+
+    @staticmethod
+    def describe_classes(labels, centers, min_area=1):
+        """
+        One entry per detected class, largest first.
+
+        Each entry carries the class id, its representative color, its
+        pixel count, and how many separate objects it forms.
+        """
+        described = []
+        visible = labels >= 0
+        total = int(visible.sum())
+
+        if not total:
+            return described
+
+        counts = np.bincount(labels[visible], minlength=len(centers))
+
+        for index, count in enumerate(counts):
+            if not count:
+                continue
+
+            instances = Pipeline.class_instances(
+                labels == index, min_area
+            )
+            described.append({
+                "id": int(index),
+                "color": tuple(int(v) for v in centers[index]),
+                "pixels": int(count),
+                "share": float(count) / total,
+                "instances": int(instances.max()) + 1,
+            })
+
+        described.sort(key=lambda entry: -entry["pixels"])
+
+        return described
+
+    def detect_elements(self, img, classes=10, min_area=1):
+        """Cluster an output image into classes and count their objects."""
+        data = np.asarray(img.convert("RGBA"))
+        labels, centers = self.cluster_colors(
+            np.array(data[:, :, :3], copy=True),
+            np.array(data[:, :, 3], copy=True),
+            classes
+        )
+
+        return labels, centers, self.describe_classes(
+            labels, centers, min_area
+        )
+
+    # ---------------------------------------------------------
     # Region-aware noise cleanup
     # ---------------------------------------------------------
 
@@ -730,6 +913,157 @@ class Pipeline:
 
         return rgb
 
+    @staticmethod
+    def dominant_tolerance(strength, ceiling):
+        """
+        Map a 0-100 strength to the local color-cluster radius.
+
+        For this method the strength drives the tolerance rather than an
+        area: the radius is what decides how much tonal variation counts
+        as "the same color", and it is the control that actually changes
+        the result on dirty artwork.
+        """
+        ceiling = max(1, int(round(ceiling)))
+        strength = max(0, min(100, float(strength)))
+
+        return max(1, int(round(strength / 100.0 * ceiling)))
+
+    @staticmethod
+    def clean_dominant_color(rgb, alpha, tolerance, window=3,
+                             max_similar=1, protect_silhouette=True):
+        """
+        Snap isolated pixels to the dominant color around them.
+
+        Region merging needs regions to exist. On a dirty conversion,
+        where almost every pixel is a slightly different tone, there are
+        none, so this works on a local window instead: colors are
+        bucketed at ``tolerance`` (which is what makes "most common
+        color" meaningful when every pixel is unique), and a pixel is
+        replaced by the mean of the window's dominant bucket only when
+        at most ``max_similar`` window pixels share its own bucket.
+
+        The isolation test compares colors by distance rather than by
+        shared bucket, which is what protects intentional detail: a
+        one-pixel window frame has near-identical pixels along its
+        length and survives even when anti-aliasing puts each of them in
+        a different bucket. A lone stray tone has no such neighbors.
+
+        ``max_similar`` therefore doubles as a stylization dial: 1 keeps
+        structure faithful, while 3 or 4 flattens organic texture such
+        as foliage into larger blocks. Alpha is never modified.
+        """
+        rgb = np.array(rgb, copy=True)
+        height, width = rgb.shape[:2]
+        valid = alpha > 5
+
+        if not valid.any():
+            return rgb
+
+        radius = max(1, int(window) // 2)
+        step = max(1, int(tolerance))
+
+        buckets = rgb.astype(np.int32) // step
+        keys = (
+            (buckets[:, :, 0] << 20)
+            | (buckets[:, :, 1] << 10)
+            | buckets[:, :, 2]
+        ).astype(np.int32)
+        keys = np.where(valid, keys, -1)
+
+        offsets = [
+            (dy, dx)
+            for dy in range(-radius, radius + 1)
+            for dx in range(-radius, radius + 1)
+        ]
+        count = len(offsets)
+        center = count // 2
+
+        def shifted(source, dy, dx, fill):
+            out = np.full(source.shape, fill, dtype=source.dtype)
+            rows = slice(max(0, dy), height + min(0, dy))
+            columns = slice(max(0, dx), width + min(0, dx))
+            into_rows = slice(max(0, -dy), height + min(0, -dy))
+            into_columns = slice(max(0, -dx), width + min(0, -dx))
+            out[into_rows, into_columns] = source[rows, columns]
+            return out
+
+        window_keys = np.stack(
+            [shifted(keys, dy, dx, -1) for dy, dx in offsets]
+        )
+        window_valid = window_keys >= 0
+
+        # How many window pixels share each candidate's bucket.
+        tallies = np.zeros((count, height, width), dtype=np.int16)
+
+        for index in range(count):
+            same = (window_keys == window_keys[index]) & window_valid
+            tallies[index] = same.sum(axis=0) * window_valid[index]
+
+        best = tallies.argmax(axis=0)
+        best_count = np.take_along_axis(tallies, best[None], axis=0)[0]
+        dominant = np.take_along_axis(window_keys, best[None], axis=0)[0]
+
+        # Isolation is measured by color distance, never by shared
+        # bucket. Bucket boundaries fall arbitrarily, so on an
+        # anti-aliased edge every pixel of a thin dark line lands in a
+        # different bucket and the line reads as a row of isolated
+        # pixels. That is what erased window frames and railings.
+        values = rgb.astype(np.int32)
+        limit = float(tolerance) ** 2
+        own_count = np.zeros((height, width), dtype=np.int16)
+
+        for dy, dx in offsets:
+            neighbor = shifted(values, dy, dx, 0)
+            reachable = shifted(valid, dy, dx, False)
+            close = ((neighbor - values) ** 2).sum(axis=2) <= limit
+            own_count += close & reachable
+
+        replace = (
+            valid
+            & (own_count <= max_similar)
+            & (best_count > own_count)
+            & (dominant != keys)
+        )
+
+        if protect_silhouette:
+            outside = np.pad(
+                ~valid, 1, mode="constant", constant_values=True
+            )
+            touches = (
+                outside[:-2, 1:-1]
+                | outside[2:, 1:-1]
+                | outside[1:-1, :-2]
+                | outside[1:-1, 2:]
+            )
+            replace &= ~touches
+
+        if not replace.any():
+            return rgb
+
+        # Accumulated one offset at a time; stacking the shifted colors
+        # would cost hundreds of megabytes at 512 px with a 5 px window.
+        totals = np.zeros((height, width), dtype=np.int32)
+        accumulated = np.zeros((height, width, 3), dtype=np.float32)
+
+        for index, (dy, dx) in enumerate(offsets):
+            member = (window_keys[index] == dominant) & window_valid[index]
+
+            if not member.any():
+                continue
+
+            totals += member
+            accumulated += (
+                shifted(rgb, dy, dx, 0).astype(np.float32)
+                * member[:, :, None]
+            )
+
+        mean = accumulated / np.maximum(totals, 1)[:, :, None]
+        rgb[replace] = np.clip(
+            np.rint(mean[replace]), 0, 255
+        ).astype(np.uint8)
+
+        return rgb
+
     def clean_color_noise(self, img):
         self.noise_pixels_changed = 0
 
@@ -746,23 +1080,39 @@ class Pipeline:
         )
 
         original = np.array(rgba[:, :, :3], copy=True)
+        rgb = original
+        method = self.settings.noise_method
+        protect = bool(self.settings.noise_protect)
 
-        # Grouping must stay below the merge tolerance, otherwise a
-        # fragment is absorbed while grouping and never becomes a
-        # candidate, and the controls appear to do nothing.
-        group_tolerance = min(
-            int(round(self.settings.noise_group_tolerance)),
-            max(0, tolerance - 1)
-        )
+        if method in ("Local dominant color", "Both"):
+            rgb = self.clean_dominant_color(
+                rgb,
+                alpha,
+                self.dominant_tolerance(
+                    self.settings.noise_strength, tolerance
+                ),
+                int(self.settings.noise_window),
+                max(1, int(self.settings.noise_min_isolation)),
+                protect
+            )
 
-        rgb = self.clean_region_noise(
-            original,
-            alpha,
-            tolerance,
-            max_area,
-            bool(self.settings.noise_protect),
-            group_tolerance
-        )
+        if method in ("Merge small regions", "Both"):
+            # Grouping must stay below the merge tolerance, otherwise a
+            # fragment is absorbed while grouping and never becomes a
+            # candidate, and the controls appear to do nothing.
+            group_tolerance = min(
+                int(round(self.settings.noise_group_tolerance)),
+                max(0, tolerance - 1)
+            )
+
+            rgb = self.clean_region_noise(
+                rgb,
+                alpha,
+                tolerance,
+                max_area,
+                protect,
+                group_tolerance
+            )
 
         self.noise_pixels_changed = int(
             (rgb != original).any(axis=2).sum()
@@ -772,6 +1122,156 @@ class Pipeline:
             np.dstack((rgb, alpha)).astype(np.uint8),
             "RGBA"
         )
+
+    def apply_class_overrides(self, img):
+        """
+        Repaint whole material classes with the colors chosen for them.
+
+        Each visible pixel is matched to its nearest detected class
+        center; the ones whose class has a replacement color take it.
+        Alpha is untouched, and classes without a replacement keep their
+        original per-pixel colors rather than being flattened.
+        """
+        self.recolored_pixels = 0
+
+        if self.class_colors is None or not self.class_overrides:
+            return img
+
+        if not len(self.class_colors):
+            return img
+
+        data = np.array(img.convert("RGBA"), copy=True)
+        alpha = data[:, :, 3]
+        visible = alpha > 5
+
+        if not visible.any():
+            return img
+
+        pixels = data[:, :, :3][visible].astype(np.float64)
+        assigned = self.assign_classes(pixels, self.class_colors)
+
+        replacement = np.zeros((len(self.class_colors), 3), dtype=np.uint8)
+        overridden = np.zeros(len(self.class_colors), dtype=bool)
+
+        for index, colour in self.class_overrides.items():
+            if 0 <= int(index) < len(replacement):
+                replacement[int(index)] = colour
+                overridden[int(index)] = True
+
+        chosen = overridden[assigned]
+
+        if not chosen.any():
+            return img
+
+        updated = data[:, :, :3][visible]
+        updated[chosen] = replacement[assigned[chosen]]
+        data[:, :, :3][visible] = updated
+
+        self.recolored_pixels = int(chosen.sum())
+
+        return Image.fromarray(data, "RGBA")
+
+    def reduce_palette(self, img):
+        """Quantize to the requested number of colors, alpha untouched."""
+        colors = int(self.settings.palette)
+
+        if colors <= 0:
+            return img
+
+        colors = max(2, min(256, colors))
+
+        dither = (
+            Image.Dither.FLOYDSTEINBERG
+            if self.settings.dither
+            else Image.Dither.NONE
+        )
+
+        rgb = img.convert(
+            "RGB"
+        ).quantize(
+            colors=colors,
+            method=Image.Quantize.MEDIANCUT,
+            dither=dither
+        ).convert("RGB")
+
+        return Image.merge(
+            "RGBA",
+            (
+                *rgb.split(),
+                img.getchannel("A")
+            )
+        )
+
+    # ---------------------------------------------------------
+    # Average color blend
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def average_color(rgb, mask):
+        """Mean color of the masked pixels, or None when none are set."""
+        if not mask.any():
+            return None
+
+        return rgb[mask].astype(np.float64).mean(axis=0)
+
+    def apply_average_blend(self, img):
+        """
+        Pull colors towards one average, by a sliding amount.
+
+        This is the blunt counterpart to recoloring a class: instead of
+        replacing a color outright it drags every pixel towards a single
+        average, so 0 leaves the image alone and 100 flattens the area
+        to one flat tone. The average is taken either from the whole
+        visible image or from the active selection, which is what makes
+        it useful for unifying one material without sampling the rest.
+        """
+        self.average_blended_pixels = 0
+
+        amount = max(0.0, min(100.0, float(self.settings.average_blend)))
+
+        if amount <= 0:
+            return img
+
+        amount /= 100.0
+
+        data = np.array(img.convert("RGBA"), copy=True)
+        rgb = data[:, :, :3]
+        visible = data[:, :, 3] > 5
+
+        if not visible.any():
+            return img
+
+        sampled = visible
+
+        if (
+            self.settings.average_source == "Selection"
+            and self.mask is not None
+            and self.mask.shape == visible.shape
+        ):
+            selected = visible & self.mask
+
+            # Falling back to the whole image keeps the slider useful
+            # before any selection has been made.
+            if selected.any():
+                sampled = selected
+
+        average = self.average_color(rgb, sampled)
+
+        if average is None:
+            return img
+
+        blended = rgb.astype(np.float64)
+        blended[visible] = (
+            blended[visible] * (1.0 - amount) + average * amount
+        )
+
+        data[:, :, :3] = np.clip(
+            np.rint(blended), 0, 255
+        ).astype(np.uint8)
+
+        self.average_blended_pixels = int(visible.sum())
+
+        return Image.fromarray(data, "RGBA")
 
     # ---------------------------------------------------------
     # Outer border
@@ -1152,6 +1652,8 @@ class Pipeline:
             )
 
         self.outer_border_clipped = False
+        self.recolored_pixels = 0
+        self.average_blended_pixels = 0
         img = source.copy()
 
         if self.settings.crop:
@@ -1211,8 +1713,9 @@ class Pipeline:
             self.settings.mode
             == "Pixel Art Reconstruction"
         ):
-            img = self.reconstruct_pixel_art(
-                img
+            img = self.restrict(
+                img,
+                self.reconstruct_pixel_art(img)
             )
 
         img = self.restrict(
@@ -1220,37 +1723,10 @@ class Pipeline:
             self.apply_color_effects(img)
         )
 
-        colors = int(
-            self.settings.palette
+        img = self.restrict(
+            img,
+            self.reduce_palette(img)
         )
-
-        if colors > 0:
-            colors = max(
-                2,
-                min(256, colors)
-            )
-
-            dither = (
-                Image.Dither.FLOYDSTEINBERG
-                if self.settings.dither
-                else Image.Dither.NONE
-            )
-
-            rgb = img.convert(
-                "RGB"
-            ).quantize(
-                colors=colors,
-                method=Image.Quantize.MEDIANCUT,
-                dither=dither
-            ).convert("RGB")
-
-            img = Image.merge(
-                "RGBA",
-                (
-                    *rgb.split(),
-                    img.getchannel("A")
-                )
-            )
 
         # Cleanup runs on the final resolution, after palette reduction
         # and before any outline is drawn.
@@ -1259,12 +1735,23 @@ class Pipeline:
             self.clean_color_noise(img)
         )
 
-        img = self.add_outer_border(
+        img = self.apply_class_overrides(
             img
         )
 
-        img = self.add_object_borders(
-            img
+        img = self.restrict(
+            img,
+            self.apply_average_blend(img)
+        )
+
+        img = self.restrict(
+            img,
+            self.add_outer_border(img)
+        )
+
+        img = self.restrict(
+            img,
+            self.add_object_borders(img)
         )
 
         if self.settings.alpha:

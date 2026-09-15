@@ -1,5 +1,5 @@
 
-# Pixel Art Converter v2.8
+# Pixel Art Converter v2.12
 
 Desktop utility for converting illustrations into crisp pixel-art assets.
 
@@ -39,10 +39,13 @@ Desktop utility for converting illustrations into crisp pixel-art assets.
   hover tooltips.
 - Disables reconstruction-only controls in **Pixel Perfect Resize** while keeping
   their values for when reconstruction is selected again.
-- Removes small stray color fragments with a conservative, region-aware cleanup.
+- Removes small stray color fragments with two complementary cleanup methods, one
+  for dirty conversions and one for already-flat artwork.
 - Records an undo/redo history of setting changes, with `Ctrl+Z` and `Ctrl+Y`.
 - Supports non-destructive rectangle, connected-region, and brush selections on the
   preview, and can restrict color effects to the selected pixels.
+- Detects material classes and their individual objects, turns either into a
+  selection, and can repaint whole classes with a color of your choice.
 - Exports PNG, WebP, and JPEG.
 
 ## Color and outline tools
@@ -64,16 +67,59 @@ Desktop utility for converting illustrations into crisp pixel-art assets.
 
 ## Noise cleanup
 
-Region-aware cleanup replaces small stray color fragments — an off-yellow pixel inside a
-yellow wall — with the color of the region around them. It runs at the final resolution,
-after palette reduction and before any outline, so it reuses the output the user sees:
+Cleanup runs at the final resolution, after palette reduction and before any outline, so
+it works on the output you actually see:
 
 ```text
 crop -> resize -> reconstruction -> color effects -> palette reduction
      -> noise cleanup -> outer border -> internal outlines
 ```
 
-The stage works with two different tolerances, and the difference matters:
+Two methods are available, because they solve different problems:
+
+| Method | How it works | Use it for |
+| --- | --- | --- |
+| **Local dominant color** (default) | Snaps an isolated pixel to the dominant color of the window around it | Dirty conversions with many tonal variations |
+| **Merge small regions** | Folds a small fragment into a larger adjacent fragment | Artwork that is already flat or palette-reduced |
+| **Both** | Dominant color first to consolidate, then region merging | Mixed sources |
+
+Neither method modifies alpha, and **Protect silhouette** (on by default) leaves fragments
+that touch transparency or the canvas edge untouched. The status bar reports how many
+pixels the stage actually changed, so a setting that cleans nothing says so.
+
+### Local dominant color
+
+Region merging needs regions to exist. On a dirty conversion almost every pixel is a
+slightly different tone, so there are none — which is why that method can look inert on
+exactly the images that need cleaning most. This method works on a local window instead.
+
+Colors are bucketed at the cluster radius, which is what makes "most common color"
+meaningful when every pixel is unique. A pixel is replaced by the mean of its window's
+dominant bucket only when at most **Isolation threshold** window pixels are within the
+cluster radius of it.
+
+That isolation test compares colors *by distance, never by shared bucket*. Bucket
+boundaries fall arbitrarily, so on an anti-aliased edge each pixel of a one-pixel window
+frame lands in a different bucket and the whole line reads as isolated pixels — which
+erased frames, railings and corner lines on downscaled artwork. Measuring distance
+instead keeps them: a thin line has near-identical pixels along its length, a stray tone
+has none. Flat artwork comes out **byte-for-byte identical at every strength**.
+
+**Isolation threshold** therefore doubles as a stylization dial. At `1` structure stays
+faithful. At `3` or `4` organic texture such as foliage flattens into larger blocks while
+architectural lines still hold, which is useful when only part of the image should read
+as chunky pixel art — combine it with a brush selection and **Apply color effects to
+selection only** to get both looks in one image.
+
+`Cleanup strength` scales the cluster radius up to the `Cleanup color tolerance` ceiling.
+On a noisy brick facade, raising it takes local variance down by roughly half. On a
+perfectly smooth gradient the effect peaks and then eases off, because past a certain
+radius the filter correctly concludes that neighboring tones are all the same color and
+leaves them alone.
+
+### Merge small regions
+
+Fragments are connected groups of near-identical color, controlled by two tolerances:
 
 | Control | Meaning |
 | --- | --- |
@@ -81,12 +127,7 @@ The stage works with two different tolerances, and the difference matters:
 | **Cleanup color tolerance** | How different an adjacent fragment may be before it can *absorb* a small one. |
 
 Grouping must stay below the merge tolerance, or a fragment is swallowed while grouping
-and never becomes a candidate at all; the pipeline clamps it if you set it higher.
-
-At grouping `0` only identical colors group together. That suits artwork that has already
-been quantized through **Palette**, but on continuous-tone art every pixel becomes its own
-fragment and almost nothing can be cleaned — which is why the default is `2` rather than
-`0`.
+and never becomes a candidate; the pipeline clamps it if you set it higher.
 
 A fragment is merged only when all of the following hold:
 
@@ -95,13 +136,8 @@ A fragment is merged only when all of the following hold:
 - that neighbor's color is within **Cleanup color tolerance**.
 
 Requiring a strictly larger neighbor is what stops two speckles from merging into each
-other, and it keeps **Cleanup strength** monotonic: raising it can only ever clean more,
-never less. Alpha is never modified, and **Protect silhouette** (on by default) leaves
-fragments that touch transparency or the canvas edge untouched.
-
-`Cleanup strength` scales from one-pixel speckles up to the advanced `Maximum region
-area` ceiling and never past it. The status bar reports how many pixels the stage
-actually changed, so a setting that cleans nothing says so instead of looking broken.
+other, and it keeps the strength control monotonic. `Cleanup strength` scales from
+one-pixel speckles up to the advanced `Maximum region area` ceiling and never past it.
 
 ## Edit history
 
@@ -116,6 +152,56 @@ is cleared when a new source image is opened.
 | --- | --- |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Y` or `Ctrl+Shift+Z` | Redo |
+
+## Element detection
+
+Detection answers "where are the windows, the walls, the foliage" in two levels:
+
+| Level | What it is | How it is found |
+| --- | --- | --- |
+| **Class** | A material: lit brick, shaded brick, glass, foliage, balcony slab | k-means over the output colors |
+| **Object** | One instance of a class, such as a single window | Connected components inside that class |
+
+Press **Detect elements** and the panel lists each class with its color, its share of the
+image, and how many separate objects it forms. Selecting a class makes it the active
+selection, so everything that already works on a selection — local color effects, noise
+cleanup, outlines — works per material. The `<` and `>` buttons step through the
+individual objects of the selected class, with the whole class as the first entry.
+
+Clustering runs on RGB. Dropping luminance was measured to be worse here: value is most
+of what separates glass from render from stone in pixel art, and chromaticity-only
+clustering fragmented facades along lines that did not follow the architecture.
+
+Two things worth knowing:
+
+- **A class is a material, not a name.** The tool reports "class 6, blue, 5.2% of the
+  image, 87 objects"; it does not know that blue means glass. Naming it is your call.
+- **Lighting creates separate classes.** A lit wall and a shaded wall are two classes,
+  which is correct for pixel art — those faces are edited separately. Treat them as two
+  selections rather than expecting one "wall" class.
+
+### Recoloring a class
+
+Select a class and press **Recolor class...** to give it a replacement color. What is
+stored is a *mapping*, not an edit to a rendered image: on every render each visible pixel
+is matched to its nearest class center and the mapped classes take their new color. Three
+things follow from that.
+
+- **Several classes can be recolored at once.** Give the glass one blue and the shaded
+  wall another, and both hold. Editing through the global color controls could only ever
+  apply the last change, which is what made the selection feel like it did nothing.
+- **A recolor survives other settings.** Change the border, the cleanup or the palette and
+  the classes keep their colors.
+- **Untouched classes keep their own pixels.** Only the mapped classes are flattened to a
+  single color; everything else keeps its per-pixel shading.
+
+Recoloring runs after cleanup, so cleanup cannot undo it, and before the outlines, so
+borders are drawn around the final colors. Alpha is never modified, and each recolor is
+one undoable action. Detecting again clears the mapping, since it refers to the previous
+clustering.
+
+Detection is tied to the output geometry. If the target size changes it is reported as
+stale rather than being applied to the wrong pixels.
 
 ## Selection and local effects
 
@@ -134,13 +220,49 @@ motion, so a fast drag leaves no gaps, and each completed stroke is one undoable
 Canvas coordinates are converted through zoom and scroll offsets, so the same pixels are
 addressed at any zoom level.
 
-With **Apply color effects to selection only**, invert, grayscale, RGB tints, and noise
-cleanup are confined to the selected pixels. Contrast runs before the resize, so it stays
-global. Alpha is preserved either way.
+With **Apply everything to selection only**, every stage that runs at the final
+resolution is confined to the selected pixels:
+
+| Restricted | Always global |
+| --- | --- |
+| Pixel-art reconstruction | Auto-crop |
+| Invert, grayscale, RGB tints | Contrast |
+| Average blend | Median noise removal |
+| Palette reduction | Progressive resize |
+| Noise cleanup | |
+| Outer border and internal outlines | |
+
+The right-hand column runs *before* the resize, where the mask coordinates do not exist
+yet, so those stages cannot be restricted without guessing where the selection would land.
+
+Note that restricting reconstruction is blunt: with the toggle on, the area outside the
+selection is left unreconstructed. That is the point of the toggle, but it is worth
+knowing that it changes more than the color stages. Alpha is preserved either way.
 
 If the output dimensions change, remapping would be ambiguous, so the selection is
 cleared and reported rather than silently applied to the wrong pixels. The pipeline
 independently ignores a mask that does not match the image it is given.
+
+## Average blend
+
+**Average blend** drags every pixel towards a single average color: `0` leaves the image
+alone, `100` flattens the area to one flat tone, and the steps in between are a smooth
+progression. It is the blunt counterpart to recoloring a class — no detection is needed,
+and it works on whatever is selected.
+
+**Average color from** decides where the average is sampled:
+
+- `Selection` uses the active class, object or brush mask, and falls back to the whole
+  image when nothing is selected. This is what unifies one material without dragging in
+  the colors of everything around it.
+- `Whole image` always samples every visible pixel.
+
+The sampling source and the affected area are separate: pair `Selection` with **Apply
+everything to selection only** to sample *and* apply within one material, or sample from
+the selection and apply globally to pull the whole image towards that material's tone.
+
+Alpha is never modified, and the blend runs after class recoloring, so it can flatten a
+recolored class further.
 
 ## Preview navigation
 

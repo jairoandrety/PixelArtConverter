@@ -133,6 +133,9 @@ class PixelArtConverter:
         "object_border_color": "#000000",
 
         "noise_cleanup": False,
+        "noise_method": "Local dominant color",
+        "noise_window": 3,
+        "noise_min_isolation": 1,
         "noise_strength": 30,
         "noise_tolerance": 20,
         "noise_group_tolerance": 2,
@@ -140,13 +143,17 @@ class PixelArtConverter:
         "noise_protect": True,
 
         "selection_mode": "Rectangle",
+        "detect_classes": 10,
+        "detect_min_area": 3,
         "brush_size": 3,
         "local_effects": False,
+        "average_blend": 0,
+        "average_source": "Selection",
     }
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Pixel Art Converter v2.8")
+        self.root.title("Pixel Art Converter v2.12")
         self.root.geometry("1370x900")
         self.root.minsize(1150, 760)
 
@@ -162,8 +169,18 @@ class PixelArtConverter:
         self.selection = None
         self.selection_shape = None
         self.selection_anchor = None
+        self.detected_labels = None
+        self.detected_shape = None
+        self.class_colors = None
+        self.class_overrides = {}
+        self.detected_classes = []
+        self.active_class = None
+        self.instance_labels = None
+        self.instance_index = 0
         self.last_render_seconds = 0.0
         self.noise_pixels_changed = 0
+        self.recolored_pixels = 0
+        self.average_blended_pixels = 0
 
         self.zoom = tk.DoubleVar(value=100)
         self.vars = {
@@ -179,7 +196,7 @@ class PixelArtConverter:
             for key, value in self.DEFAULTS.items()
         }
 
-        self.history_state = (dict(self.DEFAULTS), None)
+        self.history_state = (dict(self.DEFAULTS), None, {})
         self.build_ui()
 
     # ---------------------------------------------------------
@@ -332,7 +349,7 @@ class PixelArtConverter:
 
         ttk.Label(
             left,
-            text="v2.8 • Local Brush and Fast Segmentation",
+            text="v2.12 • Average Blend and Fully Local Stages",
             foreground="#666"
         ).pack(anchor="w", pady=(0, 10))
 
@@ -546,6 +563,41 @@ class PixelArtConverter:
             command=self.schedule_preview
         ).pack(anchor="w", pady=2)
 
+        average_row = ttk.Frame(left)
+        average_row.pack(fill="x", pady=(6, 0))
+
+        ttk.Label(average_row, text="Average color from").pack(side="left")
+
+        average_source = ttk.Combobox(
+            average_row,
+            textvariable=self.vars["average_source"],
+            values=["Selection", "Whole image"],
+            state="readonly",
+            width=12
+        )
+        average_source.pack(side="right")
+        average_source.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self.schedule_preview()
+        )
+        Tooltip(
+            average_source,
+            "Where the average is sampled from. Selection uses the "
+            "active class or brush mask and falls back to the whole "
+            "image when nothing is selected."
+        )
+
+        self.add_scale(
+            left, "Average blend",
+            "average_blend", 0, 100,
+            help_text=(
+                "Drags every pixel towards a single average color. 0 "
+                "leaves the image alone and 100 flattens it to one flat "
+                "tone. Blunter than recoloring a class, and it needs no "
+                "detection to work."
+            )
+        )
+
         mono = ttk.Combobox(
             left,
             textvariable=self.vars["monochrome"],
@@ -719,17 +771,43 @@ class PixelArtConverter:
         noise_check.pack(anchor="w", pady=2)
         Tooltip(
             noise_check,
-            "Replaces small stray color fragments with the closest "
-            "adjacent region color. Runs at the final resolution, "
-            "after palette reduction and before any outline."
+            "Removes small stray color fragments. Runs at the final "
+            "resolution, after palette reduction and before any "
+            "outline."
+        )
+
+        method = ttk.Combobox(
+            left,
+            textvariable=self.vars["noise_method"],
+            values=[
+                "Local dominant color",
+                "Merge small regions",
+                "Both"
+            ],
+            state="readonly"
+        )
+        method.pack(fill="x", pady=2)
+        method.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self.schedule_preview()
+        )
+        Tooltip(
+            method,
+            "Local dominant color snaps isolated pixels to the color "
+            "around them; it is the one that works on dirty artwork "
+            "with many tonal variations. Merge small regions folds "
+            "small fragments into a larger neighbor, which needs the "
+            "artwork to already be flat or palette-reduced."
         )
 
         self.add_scale(
             left, "Cleanup strength",
             "noise_strength", 0, 100,
             help_text=(
-                "Higher values remove larger fragments. Low values only "
-                "reach single-pixel speckles."
+                "Local dominant color: how much tonal variation counts "
+                "as the same color. Merge small regions: how large a "
+                "fragment may be and still be removed. Both scale up "
+                "to the advanced ceilings and never past them."
             )
         )
 
@@ -779,6 +857,26 @@ class PixelArtConverter:
             )
         )
 
+        self.add_scale(
+            advanced_frame, "Dominant color window",
+            "noise_window", 3, 7,
+            help_text=(
+                "Size of the neighborhood searched for the dominant "
+                "color. Larger windows clean more but cost more time."
+            )
+        )
+
+        self.add_scale(
+            advanced_frame, "Isolation threshold",
+            "noise_min_isolation", 1, 4,
+            help_text=(
+                "How many neighbors may share a pixel's color before it "
+                "counts as real detail instead of noise. 1 is safe and "
+                "never touches flat artwork; raising it starts eating "
+                "one-pixel lines such as mortar joints."
+            )
+        )
+
         protect_check = ttk.Checkbutton(
             advanced_frame,
             text="Protect silhouette",
@@ -791,6 +889,116 @@ class PixelArtConverter:
             "Leaves fragments that touch transparency or the canvas "
             "edge untouched, so the outline of the sprite is preserved."
         )
+
+        self.section(left, "ELEMENT DETECTION")
+
+        self.add_scale(
+            left, "Color classes",
+            "detect_classes", 4, 24,
+            help_text=(
+                "How many material groups to split the image into. A "
+                "class is a material, not an object: lit brick and "
+                "shaded brick are separate classes because they are "
+                "edited separately."
+            )
+        )
+
+        self.add_scale(
+            left, "Minimum object size",
+            "detect_min_area", 1, 64,
+            help_text=(
+                "Objects smaller than this many pixels are not counted "
+                "as separate instances of a class."
+            )
+        )
+
+        ttk.Button(
+            left,
+            text="Detect elements",
+            command=self.detect_elements
+        ).pack(fill="x", pady=3)
+
+        self.class_list = ttk.Treeview(
+            left,
+            columns=("color", "share", "objects", "recolor"),
+            show="headings",
+            height=7,
+            selectmode="browse"
+        )
+        self.class_list.heading("color", text="Color")
+        self.class_list.heading("share", text="Share")
+        self.class_list.heading("objects", text="Objects")
+        self.class_list.heading("recolor", text="New")
+        self.class_list.column("color", width=78, anchor="w")
+        self.class_list.column("share", width=56, anchor="e")
+        self.class_list.column("objects", width=56, anchor="e")
+        self.class_list.column("recolor", width=78, anchor="w")
+        self.class_list.pack(fill="x", pady=2)
+        self.class_list.bind("<<TreeviewSelect>>", self.class_selected)
+
+        self.detection_label = ttk.Label(
+            left,
+            text="Not detected yet",
+            foreground="#666666",
+            wraplength=310
+        )
+        self.detection_label.pack(anchor="w", pady=(2, 0))
+
+        instance_row = ttk.Frame(left)
+        instance_row.pack(fill="x", pady=3)
+
+        self.previous_button = ttk.Button(
+            instance_row,
+            text="<",
+            width=3,
+            command=lambda: self.step_instance(-1)
+        )
+        self.previous_button.pack(side="left")
+
+        self.instance_label = ttk.Label(
+            instance_row,
+            text="no class selected",
+            anchor="center"
+        )
+        self.instance_label.pack(side="left", fill="x", expand=True)
+
+        self.next_button = ttk.Button(
+            instance_row,
+            text=">",
+            width=3,
+            command=lambda: self.step_instance(1)
+        )
+        self.next_button.pack(side="left")
+
+        recolor_row = ttk.Frame(left)
+        recolor_row.pack(fill="x", pady=3)
+
+        self.recolor_button = ttk.Button(
+            recolor_row,
+            text="Recolor class...",
+            command=self.recolor_class,
+            state="disabled"
+        )
+        self.recolor_button.pack(side="left", fill="x", expand=True)
+
+        self.clear_recolor_button = ttk.Button(
+            recolor_row,
+            text="Clear",
+            width=7,
+            command=self.clear_recolors,
+            state="disabled"
+        )
+        self.clear_recolor_button.pack(side="left", padx=(4, 0))
+
+        Tooltip(
+            self.recolor_button,
+            "Assigns a replacement color to the selected class. The "
+            "mapping is kept and reapplied on every render, so several "
+            "classes can be recolored at once and the result survives "
+            "changes to the other settings."
+        )
+
+        ttk.Separator(left).pack(fill="x", pady=8)
 
         self.section(left, "SELECTION")
 
@@ -830,16 +1038,19 @@ class PixelArtConverter:
 
         local_check = ttk.Checkbutton(
             left,
-            text="Apply color effects to selection only",
+            text="Apply everything to selection only",
             variable=self.vars["local_effects"],
             command=self.schedule_preview
         )
         local_check.pack(anchor="w", pady=2)
         Tooltip(
             local_check,
-            "Restricts invert, grayscale, RGB tints, and noise cleanup "
-            "to the selected pixels. Contrast runs before the resize, "
-            "so it stays global."
+            "Restricts every stage that runs at the final resolution "
+            "to the selected pixels: reconstruction, color effects, "
+            "average blend, palette reduction, noise cleanup and both "
+            "kinds of outline. Auto-crop, contrast and the median "
+            "cleanup run before the resize, where the mask does not "
+            "exist yet, so those stay global."
         )
 
         self.selection_label = ttk.Label(
@@ -1000,6 +1211,206 @@ class PixelArtConverter:
         )
 
         self.update_history_buttons()
+
+    # ---------------------------------------------------------
+    # Element detection
+    # ---------------------------------------------------------
+
+    def detect_elements(self):
+        """Group the current output into color classes and their objects."""
+        if self.preview_source is None:
+            self.detection_label.config(text="Open an image first.")
+            return
+
+        self.detection_label.config(text="Detecting...")
+        self.detection_label.update_idletasks()
+
+        pipeline = Pipeline(self.build_settings())
+        labels, centers, classes = pipeline.detect_elements(
+            self.preview_source,
+            int(self.vars["detect_classes"].get()),
+            int(self.vars["detect_min_area"].get())
+        )
+
+        self.detected_labels = labels
+        self.detected_shape = self.selection_signature()
+        self.detected_classes = classes
+        self.class_colors = centers
+        # Replacements refer to the previous clustering, so they cannot
+        # be carried over to a fresh one.
+        self.class_overrides = {}
+        self.active_class = None
+        self.instance_labels = None
+        self.instance_index = 0
+
+        self.class_list.delete(*self.class_list.get_children())
+
+        for entry in classes:
+            colour = "#%02x%02x%02x" % entry["color"]
+            tag = f"class{entry['id']}"
+            # A readable caption on either a dark or a light swatch.
+            luminance = (
+                0.299 * entry["color"][0]
+                + 0.587 * entry["color"][1]
+                + 0.114 * entry["color"][2]
+            )
+            self.class_list.tag_configure(
+                tag,
+                background=colour,
+                foreground="#000000" if luminance > 140 else "#ffffff"
+            )
+            self.class_list.insert(
+                "", "end",
+                iid=str(entry["id"]),
+                values=(
+                    colour,
+                    f"{entry['share'] * 100:.1f}%",
+                    entry["instances"],
+                    ""
+                ),
+                tags=(tag,)
+            )
+
+        self.detection_label.config(
+            text=f"{len(classes)} classes detected. Pick one to select it."
+        )
+        self.update_instance_controls()
+        self.update_recolor_controls()
+
+    def class_selected(self, _event=None):
+        chosen = self.class_list.selection()
+
+        if not chosen or self.detected_labels is None:
+            return
+
+        if self.detected_shape != self.selection_signature():
+            self.detection_label.config(
+                text="Detection is stale: output size changed."
+            )
+            return
+
+        self.active_class = int(chosen[0])
+        mask = self.detected_labels == self.active_class
+
+        # Instances are the connected objects inside the class, so they
+        # are only worth computing once a class is actually picked.
+        self.instance_labels = Pipeline.class_instances(
+            mask, int(self.vars["detect_min_area"].get())
+        )
+        self.instance_index = 0
+
+        self.set_selection(mask, f"class {self.active_class}")
+        self.update_instance_controls()
+        self.update_recolor_controls()
+        self.record_history(f"Select class {self.active_class}")
+
+    def instance_count(self):
+        if self.instance_labels is None:
+            return 0
+
+        return int(self.instance_labels.max()) + 1
+
+    def show_instance(self, index):
+        """Index 0 selects the whole class; 1..n select one object."""
+        total = self.instance_count()
+
+        if not total or self.active_class is None:
+            return
+
+        self.instance_index = max(0, min(index, total))
+
+        if self.instance_index == 0:
+            mask = self.detected_labels == self.active_class
+            description = f"class {self.active_class}"
+        else:
+            mask = self.instance_labels == (self.instance_index - 1)
+            description = (
+                f"class {self.active_class}, object {self.instance_index}"
+            )
+
+        self.set_selection(mask, description)
+        self.update_instance_controls()
+
+    def step_instance(self, delta):
+        total = self.instance_count()
+
+        if not total:
+            return
+
+        # Wraps around, with 0 acting as the whole-class entry.
+        self.show_instance((self.instance_index + delta) % (total + 1))
+        self.record_history("Select object")
+
+    def update_instance_controls(self):
+        total = self.instance_count()
+        state = "normal" if total else "disabled"
+
+        for widget in (self.previous_button, self.next_button):
+            widget.config(state=state)
+
+        if not total:
+            self.instance_label.config(text="no class selected")
+        elif self.instance_index == 0:
+            self.instance_label.config(text=f"whole class ({total} objects)")
+        else:
+            self.instance_label.config(
+                text=f"object {self.instance_index}/{total}"
+            )
+
+    def recolor_class(self):
+        """Assign a replacement color to the selected class."""
+        if self.active_class is None or self.class_colors is None:
+            return
+
+        current = self.class_overrides.get(
+            self.active_class,
+            tuple(int(v) for v in self.class_colors[self.active_class])
+        )
+
+        chosen = colorchooser.askcolor(
+            initialcolor="#%02x%02x%02x" % tuple(current),
+            title=f"Color for class {self.active_class}"
+        )[1]
+
+        if not chosen:
+            return
+
+        self.class_overrides[self.active_class] = tuple(
+            int(channel) for channel in Pipeline.hex_to_rgb(chosen)
+        )
+        self.update_recolor_controls()
+        self.record_history(f"Recolor class {self.active_class}")
+        self.schedule_preview()
+
+    def clear_recolors(self):
+        if not self.class_overrides:
+            return
+
+        self.class_overrides = {}
+        self.update_recolor_controls()
+        self.record_history("Clear class recolors")
+        self.schedule_preview()
+
+    def update_recolor_controls(self):
+        self.recolor_button.config(
+            state="normal" if self.active_class is not None else "disabled"
+        )
+        self.clear_recolor_button.config(
+            state="normal" if self.class_overrides else "disabled"
+        )
+
+        for entry in self.detected_classes:
+            row = str(entry["id"])
+
+            if not self.class_list.exists(row):
+                continue
+
+            override = self.class_overrides.get(entry["id"])
+            self.class_list.set(
+                row,
+                "recolor",
+                "" if override is None else "#%02x%02x%02x" % tuple(override)
+            )
 
     # ---------------------------------------------------------
     # Non-destructive selection
@@ -1198,6 +1609,14 @@ class PixelArtConverter:
                 text="Selection cleared: output size changed"
             )
 
+        if (
+            self.detected_labels is not None
+            and self.detected_shape != self.selection_signature()
+        ):
+            self.detection_label.config(
+                text="Detection is stale: run it again."
+            )
+
     def draw_selection(self):
         """Overlay the selection outline without altering any pixel."""
         self.canvas.delete("selection")
@@ -1343,9 +1762,27 @@ class PixelArtConverter:
 
         return bits[:shape[0] * shape[1]].astype(bool).reshape(shape)
 
+    @staticmethod
+    def normalize_overrides(overrides):
+        """
+        Class recolors as plain integer tuples, never NumPy arrays.
+
+        History entries are compared with ``==``; a dict holding arrays
+        raises "truth value is ambiguous" instead of comparing, which
+        broke stepping between the objects of a class.
+        """
+        return {
+            int(key): tuple(int(channel) for channel in value)
+            for key, value in overrides.items()
+        }
+
     def current_state(self):
-        """Settings plus selection metadata; never a rendered image."""
-        return (self.snapshot(), self.packed_selection())
+        """Settings, selection metadata and class recolors."""
+        return (
+            self.snapshot(),
+            self.packed_selection(),
+            self.normalize_overrides(self.class_overrides),
+        )
 
     @staticmethod
     def describe_change(before, after):
@@ -1406,10 +1843,14 @@ class PixelArtConverter:
         )
 
         if description is None:
-            if self.history_state[1] == current[1]:
+            if self.history_state[1:] == current[1:]:
                 return
 
-            description = "Selection"
+            description = (
+                "Selection"
+                if self.history_state[2] == current[2]
+                else "Class recolor"
+            )
 
         self.undo_stack.append((self.history_state, label or description))
         del self.undo_stack[:-self.HISTORY_LIMIT]
@@ -1419,8 +1860,8 @@ class PixelArtConverter:
         self.update_history_buttons()
 
     def apply_snapshot(self, state):
-        """Restore settings and selection without recording an entry."""
-        settings, packed = state
+        """Restore settings, selection and recolors without recording."""
+        settings, packed, overrides = state
 
         self.restoring_history = True
 
@@ -1431,6 +1872,7 @@ class PixelArtConverter:
         finally:
             self.restoring_history = False
 
+        self.class_overrides = dict(overrides)
         self.selection = self.unpack_selection(packed)
         self.selection_shape = (
             self.selection_signature()
@@ -1456,6 +1898,7 @@ class PixelArtConverter:
         )
 
         self.update_mode_state()
+        self.update_recolor_controls()
         self.update_history_buttons()
         self.schedule_preview()
 
@@ -1826,12 +2269,16 @@ class PixelArtConverter:
         """Run the pipeline on the loaded image and collect its warnings."""
         pipeline = Pipeline(
             self.build_settings(),
-            mask=self.selection
+            mask=self.selection,
+            class_colors=self.class_colors,
+            class_overrides=self.class_overrides
         )
         result = pipeline.run(self.src)
 
         self.outer_border_margin_warning = pipeline.outer_border_clipped
         self.noise_pixels_changed = pipeline.noise_pixels_changed
+        self.recolored_pixels = pipeline.recolored_pixels
+        self.average_blended_pixels = pipeline.average_blended_pixels
 
         return result
 
@@ -1882,6 +2329,17 @@ class PixelArtConverter:
                 f"{self.vars['mode'].get()} | "
                 f"Zoom {self.zoom.get():.0f}%"
             )
+
+            if self.average_blended_pixels:
+                status += (
+                    f" | average {self.vars['average_blend'].get():.0f}%"
+                )
+
+            if self.recolored_pixels:
+                status += (
+                    f" | recolored {len(self.class_overrides)} classes, "
+                    f"{self.recolored_pixels} px"
+                )
 
             if self.vars["noise_cleanup"].get():
                 # Without this the controls give no feedback at all when

@@ -13,6 +13,128 @@ def pipeline(**overrides):
     return Pipeline(Settings(**overrides))
 
 
+class SelfCallTests(unittest.TestCase):
+    """
+    Every ``self.name(...)`` in the GUI must resolve to something.
+
+    The refactor moved the pipeline helpers out of the Tk class, and a
+    call left behind only failed when a user clicked that one button.
+    """
+
+    @staticmethod
+    def unresolved(path):
+        import ast
+
+        with open(path, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        problems = []
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+
+            known = {
+                item.name
+                for item in node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            known |= {
+                item.target.attr
+                for item in ast.walk(node)
+                if isinstance(item, ast.AnnAssign)
+                and isinstance(item.target, ast.Attribute)
+            }
+
+            for item in ast.walk(node):
+                if isinstance(item, ast.Assign):
+                    for target in item.targets:
+                        if (
+                            isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == "self"
+                        ):
+                            known.add(target.attr)
+
+            for item in ast.walk(node):
+                if not isinstance(item, ast.Call):
+                    continue
+
+                func = item.func
+
+                if (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "self"
+                    and func.attr not in known
+                ):
+                    problems.append(
+                        f"{node.name}.{func.attr} (line {item.lineno})"
+                    )
+
+        return problems
+
+    def test_the_interface_calls_only_methods_it_has(self):
+        import pixel_art_converter
+
+        self.assertEqual(
+            self.unresolved(pixel_art_converter.__file__), []
+        )
+
+    def test_the_pipeline_calls_only_methods_it_has(self):
+        import pixel_pipeline
+
+        self.assertEqual(self.unresolved(pixel_pipeline.__file__), [])
+
+
+class OverrideNormalizationTests(unittest.TestCase):
+    """
+    History entries are compared with ``==``.
+
+    Class recolors used to be stored as the NumPy arrays hex_to_rgb
+    returns, so comparing two states raised "truth value of an array is
+    ambiguous" instead of comparing. It surfaced only when nothing else
+    had changed, which is exactly what stepping between the objects of a
+    class does.
+    """
+
+    def test_arrays_become_plain_tuples(self):
+        overrides = {1: Pipeline.hex_to_rgb("#14c85a")}
+
+        normalized = PixelArtConverter.normalize_overrides(overrides)
+
+        self.assertEqual(normalized, {1: (20, 200, 90)})
+        self.assertIsInstance(normalized[1], tuple)
+        self.assertTrue(all(isinstance(v, int) for v in normalized[1]))
+
+    def test_normalized_states_compare_without_raising(self):
+        left = PixelArtConverter.normalize_overrides(
+            {1: Pipeline.hex_to_rgb("#14c85a")}
+        )
+        right = PixelArtConverter.normalize_overrides(
+            {1: Pipeline.hex_to_rgb("#14c85a")}
+        )
+
+        self.assertEqual((None, left), (None, right))
+
+    def test_raw_arrays_would_have_raised(self):
+        raw = {1: Pipeline.hex_to_rgb("#14c85a")}
+
+        with self.assertRaises(ValueError):
+            bool((None, raw) == (None, {1: Pipeline.hex_to_rgb("#14c85a")}))
+
+    def test_differing_recolors_are_not_equal(self):
+        left = PixelArtConverter.normalize_overrides({1: (1, 2, 3)})
+        right = PixelArtConverter.normalize_overrides({1: (4, 5, 6)})
+
+        self.assertNotEqual(left, right)
+
+    def test_plain_tuples_pass_through_unchanged(self):
+        self.assertEqual(
+            PixelArtConverter.normalize_overrides({2: (7, 8, 9)}),
+            {2: (7, 8, 9)},
+        )
+
+
 class SettingsTests(unittest.TestCase):
     def test_defaults_match_the_interface_defaults(self):
         defaults = Settings()
@@ -313,6 +435,7 @@ class CleanupResponsivenessTests(unittest.TestCase):
         return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
 
     def run_cleanup(self, **overrides):
+        overrides.setdefault("noise_method", "Merge small regions")
         app = pipeline(
             crop=False, progressive=False, mode="Pixel Perfect Resize",
             fit_mode="exact", width=64, height=64, alpha=True,
@@ -361,6 +484,579 @@ class CleanupResponsivenessTests(unittest.TestCase):
         app.run(self.continuous_art())
 
         self.assertEqual(app.noise_pixels_changed, 0)
+
+
+class ElementDetectionTests(unittest.TestCase):
+    @staticmethod
+    def scene():
+        """Two wall tones, four windows, and a patch of foliage."""
+        rgb = np.full((40, 40, 3), (150, 70, 45), dtype=np.uint8)
+        rgb[:, 20:] = (240, 130, 55)
+
+        for y in (5, 25):
+            for x in (5, 25):
+                rgb[y:y + 6, x:x + 6] = (20, 50, 110)
+
+        rgb[34:, :] = (60, 110, 40)
+        alpha = np.full((40, 40), 255, dtype=np.uint8)
+        return rgb, alpha
+
+    def test_clustering_is_deterministic(self):
+        rgb, alpha = self.scene()
+
+        first, centers_a = Pipeline.cluster_colors(rgb, alpha, 6)
+        second, centers_b = Pipeline.cluster_colors(rgb, alpha, 6)
+
+        np.testing.assert_array_equal(first, second)
+        np.testing.assert_array_equal(centers_a, centers_b)
+
+    def test_distinct_materials_land_in_distinct_classes(self):
+        rgb, alpha = self.scene()
+        labels, _ = Pipeline.cluster_colors(rgb, alpha, 6)
+
+        wall_left = labels[15, 2]
+        wall_right = labels[15, 38]
+        window = labels[7, 7]
+        foliage = labels[38, 20]
+
+        self.assertEqual(
+            len({wall_left, wall_right, window, foliage}), 4
+        )
+
+    def test_every_window_joins_the_same_class(self):
+        rgb, alpha = self.scene()
+        labels, _ = Pipeline.cluster_colors(rgb, alpha, 6)
+
+        corners = {labels[y + 2, x + 2] for y in (5, 25) for x in (5, 25)}
+
+        self.assertEqual(len(corners), 1)
+
+    def test_transparent_pixels_are_unclassified(self):
+        rgb, alpha = self.scene()
+        alpha[0, :] = 0
+
+        labels, _ = Pipeline.cluster_colors(rgb, alpha, 6)
+
+        self.assertTrue((labels[0, :] == -1).all())
+        self.assertTrue((labels[1:] >= 0).all())
+
+    def test_class_count_never_exceeds_the_distinct_colors(self):
+        rgb = np.full((8, 8, 3), 100, dtype=np.uint8)
+        rgb[:, 4:] = 200
+        alpha = np.full((8, 8), 255, dtype=np.uint8)
+
+        labels, centers = Pipeline.cluster_colors(rgb, alpha, 12)
+
+        self.assertLessEqual(len(centers), 2)
+        self.assertEqual(len(np.unique(labels[labels >= 0])), 2)
+
+    def test_a_fully_transparent_image_yields_nothing(self):
+        rgb, alpha = self.scene()
+        labels, centers = Pipeline.cluster_colors(
+            rgb, np.zeros_like(alpha), 6
+        )
+
+        self.assertTrue((labels == -1).all())
+        self.assertEqual(len(centers), 0)
+
+    def test_instances_are_the_connected_objects_of_a_class(self):
+        mask = np.zeros((20, 20), dtype=bool)
+        mask[2:5, 2:5] = True
+        mask[12:16, 12:16] = True
+
+        instances = Pipeline.class_instances(mask)
+
+        self.assertEqual(int(instances.max()) + 1, 2)
+        self.assertNotEqual(instances[3, 3], instances[13, 13])
+        self.assertEqual(instances[10, 10], -1)
+
+    def test_small_objects_are_filtered_out(self):
+        mask = np.zeros((20, 20), dtype=bool)
+        mask[2:8, 2:8] = True
+        mask[15, 15] = True
+
+        self.assertEqual(int(Pipeline.class_instances(mask, 1).max()) + 1, 2)
+        self.assertEqual(int(Pipeline.class_instances(mask, 4).max()) + 1, 1)
+
+    def test_classes_are_described_largest_first(self):
+        rgb, alpha = self.scene()
+        labels, centers = Pipeline.cluster_colors(rgb, alpha, 6)
+
+        described = Pipeline.describe_classes(labels, centers, 1)
+
+        self.assertEqual(
+            [entry["pixels"] for entry in described],
+            sorted((entry["pixels"] for entry in described), reverse=True),
+        )
+        self.assertAlmostEqual(
+            sum(entry["share"] for entry in described), 1.0, places=5
+        )
+
+    def test_the_window_class_reports_four_objects(self):
+        rgb, alpha = self.scene()
+        labels, centers = Pipeline.cluster_colors(rgb, alpha, 6)
+        described = Pipeline.describe_classes(labels, centers, 2)
+
+        window_class = labels[7, 7]
+        entry = next(e for e in described if e["id"] == window_class)
+
+        self.assertEqual(entry["instances"], 4)
+
+    def test_detect_elements_accepts_an_image(self):
+        rgb, alpha = self.scene()
+        image = Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
+
+        labels, centers, described = pipeline().detect_elements(image, 6, 2)
+
+        self.assertEqual(labels.shape, (40, 40))
+        self.assertTrue(described)
+        self.assertLessEqual(len(centers), 6)
+
+
+class AverageBlendTests(unittest.TestCase):
+    SIZE = 12
+
+    @staticmethod
+    def gradient():
+        columns = np.mgrid[0:12, 0:12][1]
+        rgb = np.stack(
+            [columns * 20, np.full((12, 12), 80), 255 - columns * 20], axis=2
+        ).astype(np.uint8)
+        alpha = np.full((12, 12), 255, dtype=np.uint8)
+        return rgb, alpha
+
+    def image(self):
+        rgb, alpha = self.gradient()
+        return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
+
+    def build(self, amount, mask=None, source="Whole image", local=False):
+        return Pipeline(
+            Settings(
+                crop=False, progressive=False, mode="Pixel Perfect Resize",
+                fit_mode="exact", width=12, height=12, alpha=True,
+                contrast=1.0, average_blend=amount, average_source=source,
+                local_effects=local,
+            ),
+            mask=mask,
+        )
+
+    def test_zero_leaves_the_image_alone(self):
+        original = np.asarray(self.image())
+        result = np.asarray(self.build(0).run(self.image()))
+
+        np.testing.assert_array_equal(result, original)
+
+    def test_full_blend_flattens_to_one_tone(self):
+        result = np.asarray(self.build(100).run(self.image()))
+        visible = result[:, :, 3] > 5
+
+        self.assertEqual(len(np.unique(result[:, :, :3][visible], axis=0)), 1)
+
+    def test_the_blend_is_monotonic(self):
+        spreads = [
+            float(
+                np.asarray(self.build(amount).run(self.image()))[:, :, :3]
+                .astype(float).std()
+            )
+            for amount in (0, 25, 50, 75, 100)
+        ]
+
+        self.assertEqual(spreads, sorted(spreads, reverse=True))
+
+    def test_the_average_is_the_mean_of_the_sampled_pixels(self):
+        rgb, _ = self.gradient()
+        expected = np.rint(rgb.reshape(-1, 3).mean(axis=0)).astype(int)
+
+        result = np.asarray(self.build(100).run(self.image()))
+
+        np.testing.assert_allclose(result[0, 0][:3], expected, atol=1)
+
+    def test_a_selection_source_samples_only_the_selection(self):
+        mask = np.zeros((12, 12), dtype=bool)
+        mask[:, :4] = True
+
+        rgb, _ = self.gradient()
+        expected = np.rint(rgb[mask].mean(axis=0)).astype(int)
+
+        result = np.asarray(
+            self.build(100, mask=mask, source="Selection").run(self.image())
+        )
+
+        np.testing.assert_allclose(result[0, 0][:3], expected, atol=1)
+
+    def test_an_empty_selection_falls_back_to_the_whole_image(self):
+        mask = np.zeros((12, 12), dtype=bool)
+
+        selected = np.asarray(
+            self.build(100, mask=mask, source="Selection").run(self.image())
+        )
+        whole = np.asarray(self.build(100).run(self.image()))
+
+        np.testing.assert_array_equal(selected, whole)
+
+    def test_local_effects_confine_the_blend(self):
+        mask = np.zeros((12, 12), dtype=bool)
+        mask[:, :4] = True
+
+        original = np.asarray(self.image())[:, :, :3]
+        result = np.asarray(
+            self.build(
+                100, mask=mask, source="Selection", local=True
+            ).run(self.image())
+        )[:, :, :3]
+
+        self.assertEqual(len(np.unique(result[mask], axis=0)), 1)
+        np.testing.assert_array_equal(result[~mask], original[~mask])
+
+    def test_alpha_is_never_modified(self):
+        rgb, alpha = self.gradient()
+        alpha[0, 0] = 0
+        image = Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
+
+        result = np.asarray(self.build(100).run(image))
+
+        np.testing.assert_array_equal(result[:, :, 3], alpha)
+
+
+class RestrictedStageTests(unittest.TestCase):
+    """Every final-resolution stage must honour the selection."""
+
+    @staticmethod
+    def scene():
+        """Shaded wall, a window, and a speckle inside the masked half."""
+        rows = np.mgrid[0:16, 0:16][0]
+        rgb = np.stack(
+            [150 + rows, 70 + rows // 2, 45 + rows // 3], axis=2
+        ).astype(float)
+        # Reconstruction only acts on texture, so the wall needs some.
+        rgb += np.random.default_rng(3).normal(0, 15, rgb.shape)
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+        rgb[2:6, 4:8] = (30, 60, 140)
+        rgb[3, 10] = (200, 90, 60)
+        alpha = np.full((16, 16), 255, dtype=np.uint8)
+        alpha[0, :] = 0
+        return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
+
+    def run_with(self, mask, **overrides):
+        settings = dict(
+            crop=False, progressive=False,
+            mode="Pixel Perfect Resize", fit_mode="exact",
+            width=16, height=16, alpha=True, contrast=1.0,
+            local_effects=True,
+        )
+        settings.update(overrides)
+
+        return np.asarray(
+            Pipeline(Settings(**settings), mask=mask).run(self.scene())
+        )[:, :, :3]
+
+    def assert_confined(self, **overrides):
+        mask = np.zeros((16, 16), dtype=bool)
+        mask[:8] = True
+
+        before = self.run_with(mask)
+        after = self.run_with(mask, **overrides)
+        changed = (after != before).any(axis=2)
+
+        self.assertTrue(changed.any(), f"{overrides} changed nothing")
+        self.assertEqual(int((changed & ~mask).sum()), 0)
+
+    def test_color_effects_are_confined(self):
+        self.assert_confined(invert=True)
+
+    def test_palette_reduction_is_confined(self):
+        self.assert_confined(palette=2)
+
+    def test_noise_cleanup_is_confined(self):
+        self.assert_confined(noise_cleanup=True, noise_strength=100)
+
+    def test_internal_outlines_are_confined(self):
+        self.assert_confined(object_borders=True, object_threshold=30)
+
+    def test_the_average_blend_is_confined(self):
+        self.assert_confined(average_blend=100)
+
+    def test_reconstruction_is_confined(self):
+        self.assert_confined(mode="Pixel Art Reconstruction")
+
+
+class ClassRecolorTests(unittest.TestCase):
+    @staticmethod
+    def two_tone():
+        rgb = np.full((10, 10, 3), (200, 60, 40), dtype=np.uint8)
+        rgb[:, 5:] = (40, 60, 200)
+        alpha = np.full((10, 10), 255, dtype=np.uint8)
+        return rgb, alpha
+
+    def build(self, overrides, centers=((200, 60, 40), (40, 60, 200))):
+        return Pipeline(
+            Settings(
+                crop=False, progressive=False, mode="Pixel Perfect Resize",
+                fit_mode="exact", width=10, height=10, alpha=True,
+                contrast=1.0,
+            ),
+            class_colors=np.array(centers, dtype=np.float64),
+            class_overrides=overrides,
+        )
+
+    def image(self):
+        rgb, alpha = self.two_tone()
+        return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
+
+    def test_one_class_takes_its_replacement_color(self):
+        app = self.build({1: (10, 220, 90)})
+
+        result = np.asarray(app.run(self.image()))
+
+        np.testing.assert_array_equal(result[0, 7][:3], (10, 220, 90))
+        np.testing.assert_array_equal(result[0, 2][:3], (200, 60, 40))
+
+    def test_several_classes_are_recolored_at_once(self):
+        app = self.build({0: (1, 2, 3), 1: (4, 5, 6)})
+
+        result = np.asarray(app.run(self.image()))
+
+        np.testing.assert_array_equal(result[0, 2][:3], (1, 2, 3))
+        np.testing.assert_array_equal(result[0, 7][:3], (4, 5, 6))
+        self.assertEqual(app.recolored_pixels, 100)
+
+    def test_classes_without_a_replacement_keep_their_own_pixels(self):
+        rgb, alpha = self.two_tone()
+        rgb[3, 1] = (210, 70, 50)
+        image = Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
+
+        result = np.asarray(self.build({1: (10, 220, 90)}).run(image))
+
+        np.testing.assert_array_equal(result[3, 1][:3], (210, 70, 50))
+
+    def test_alpha_is_never_modified(self):
+        rgb, alpha = self.two_tone()
+        alpha[0, 0] = 0
+        image = Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
+
+        result = np.asarray(self.build({1: (10, 220, 90)}).run(image))
+
+        np.testing.assert_array_equal(result[:, :, 3], alpha)
+
+    def test_no_overrides_leaves_the_image_alone(self):
+        plain = np.asarray(self.build({}).run(self.image()))
+        none = np.asarray(
+            Pipeline(
+                Settings(
+                    crop=False, progressive=False,
+                    mode="Pixel Perfect Resize", fit_mode="exact",
+                    width=10, height=10, alpha=True, contrast=1.0,
+                )
+            ).run(self.image())
+        )
+
+        np.testing.assert_array_equal(plain, none)
+        self.assertEqual(self.build({}).recolored_pixels, 0)
+
+    def test_an_out_of_range_class_is_ignored(self):
+        app = self.build({99: (1, 2, 3)})
+
+        result = np.asarray(app.run(self.image()))
+
+        np.testing.assert_array_equal(result[0, 2][:3], (200, 60, 40))
+        self.assertEqual(app.recolored_pixels, 0)
+
+    def test_a_recolor_survives_other_settings(self):
+        # The point of keeping a class map rather than editing pixels:
+        # the replacement is reapplied on every render.
+        app = Pipeline(
+            Settings(
+                crop=False, progressive=False, mode="Pixel Perfect Resize",
+                fit_mode="exact", width=10, height=10, alpha=True,
+                contrast=1.0, border=True, noise_cleanup=True,
+            ),
+            class_colors=np.array(
+                [(200, 60, 40), (40, 60, 200)], dtype=np.float64
+            ),
+            class_overrides={1: (10, 220, 90)},
+        )
+
+        result = np.asarray(app.run(self.image()))
+
+        np.testing.assert_array_equal(result[5, 7][:3], (10, 220, 90))
+
+
+class DominantColorTests(unittest.TestCase):
+    """The method for dirty artwork, where no real regions exist."""
+
+    SIZE = 64
+
+    @classmethod
+    def facade(cls, sigma=0):
+        """Brick wall with one-pixel mortar joints and a window."""
+        size = cls.SIZE
+        rgb = np.zeros((size, size, 3), dtype=np.uint8)
+        rgb[:, :] = (150, 70, 45)
+        rgb[(np.mgrid[0:size, 0:size][0] % 6) < 1] = (120, 55, 35)
+        rgb[10:20, 10:22] = (40, 60, 110)
+
+        if sigma:
+            noise = np.random.default_rng(2).normal(0, sigma, rgb.shape)
+            rgb = np.clip(rgb + noise, 0, 255).astype(np.uint8)
+
+        return rgb
+
+    @staticmethod
+    def alpha(size):
+        return np.full((size, size), 255, dtype=np.uint8)
+
+    @staticmethod
+    def local_variance(img):
+        values = img.astype(np.float64)
+        padded = np.pad(values, ((1, 1), (1, 1), (0, 0)), mode="edge")
+        window = np.stack([
+            padded[i:i + img.shape[0], j:j + img.shape[1]]
+            for i in range(3) for j in range(3)
+        ])
+        return float(window.var(axis=0).mean())
+
+    def clean(self, rgb, strength, **kwargs):
+        return Pipeline.clean_dominant_color(
+            rgb,
+            self.alpha(self.SIZE),
+            Pipeline.dominant_tolerance(strength, 20),
+            protect_silhouette=False,
+            **kwargs
+        )
+
+    def test_flat_artwork_is_never_touched(self):
+        # The guarantee that makes this safe as the default: a clean
+        # image must come out identical at every strength.
+        flat = self.facade()
+
+        for strength in (0, 10, 30, 50, 75, 100):
+            with self.subTest(strength=strength):
+                np.testing.assert_array_equal(
+                    self.clean(flat, strength), flat
+                )
+
+    def test_dirty_artwork_gets_less_noisy_as_strength_rises(self):
+        dirty = self.facade(sigma=12)
+
+        variances = [
+            self.local_variance(self.clean(dirty, strength))
+            for strength in (0, 30, 50, 75, 100)
+        ]
+
+        self.assertEqual(variances, sorted(variances, reverse=True))
+        self.assertLess(variances[-1], self.local_variance(dirty) * 0.8)
+
+    def test_one_pixel_lines_survive_at_the_default_isolation(self):
+        dirty = self.facade(sigma=12)
+        cleaned = self.clean(dirty, 100)
+
+        # Mortar rows must stay darker than the brick rows around them.
+        mortar = cleaned[24, 30:60].astype(int).mean()
+        brick = cleaned[26, 30:60].astype(int).mean()
+
+        self.assertLess(mortar, brick)
+
+    def test_an_antialiased_thin_line_survives(self):
+        # The defect this guards: a one-pixel window frame softened by
+        # downscaling put every one of its pixels in a different bucket,
+        # so the line read as isolated pixels and was erased.
+        size = 32
+        rgb = np.full((size, size, 3), 200, dtype=np.uint8)
+        rgb[:, 15] = 40
+        rgb[:, 14] = 120
+        rgb[:, 16] = 120
+
+        # Give the line a per-row wobble, as anti-aliasing would.
+        wobble = np.random.default_rng(9).integers(-6, 7, size)
+        for row in range(size):
+            rgb[row, 14:17] = np.clip(
+                rgb[row, 14:17].astype(int) + wobble[row], 0, 255
+            )
+
+        alpha = np.full((size, size), 255, dtype=np.uint8)
+        cleaned = Pipeline.clean_dominant_color(
+            rgb, alpha, tolerance=20, protect_silhouette=False
+        )
+
+        # The line must stay clearly darker than the field beside it.
+        line = cleaned[:, 15].astype(int).mean()
+        field = cleaned[:, 5].astype(int).mean()
+
+        self.assertLess(line, field - 100)
+
+    def test_isolated_pixels_are_still_cleaned_beside_a_line(self):
+        size = 32
+        rgb = np.full((size, size, 3), 200, dtype=np.uint8)
+        rgb[:, 15] = 40
+        rgb[7, 5] = (170, 200, 200)
+
+        alpha = np.full((size, size), 255, dtype=np.uint8)
+        cleaned = Pipeline.clean_dominant_color(
+            rgb, alpha, tolerance=20, protect_silhouette=False
+        )
+
+        np.testing.assert_array_equal(cleaned[7, 5], (200, 200, 200))
+        np.testing.assert_array_equal(cleaned[:, 15], rgb[:, 15])
+
+    def test_raising_isolation_eats_thin_detail(self):
+        flat = self.facade()
+
+        eaten = self.clean(flat, 60, max_similar=3)
+
+        self.assertFalse(np.array_equal(eaten, flat))
+
+    def test_a_larger_window_cleans_more(self):
+        dirty = self.facade(sigma=12)
+
+        narrow = self.local_variance(self.clean(dirty, 60, window=3))
+        wide = self.local_variance(self.clean(dirty, 60, window=5))
+
+        self.assertLess(wide, narrow)
+
+    def test_alpha_is_never_modified(self):
+        dirty = self.facade(sigma=12)
+        alpha = self.alpha(self.SIZE)
+        alpha[0, :] = 0
+
+        result = Pipeline.clean_dominant_color(dirty, alpha, 10)
+
+        self.assertEqual(result.shape, dirty.shape)
+
+    def test_a_fully_transparent_image_is_returned_untouched(self):
+        dirty = self.facade(sigma=12)
+        alpha = np.zeros((self.SIZE, self.SIZE), dtype=np.uint8)
+
+        np.testing.assert_array_equal(
+            Pipeline.clean_dominant_color(dirty, alpha, 10), dirty
+        )
+
+    def test_the_input_array_is_not_modified(self):
+        dirty = self.facade(sigma=12)
+        original = dirty.copy()
+
+        self.clean(dirty, 100)
+
+        np.testing.assert_array_equal(dirty, original)
+
+    def test_both_methods_run_in_sequence(self):
+        dirty = self.facade(sigma=12)
+        image = Image.fromarray(
+            np.dstack((dirty, self.alpha(self.SIZE))), "RGBA"
+        )
+
+        counts = {}
+        for method in ("Local dominant color", "Merge small regions", "Both"):
+            app = pipeline(
+                noise_cleanup=True, noise_method=method,
+                noise_strength=100, noise_protect=False,
+            )
+            app.clean_color_noise(image)
+            counts[method] = app.noise_pixels_changed
+
+        self.assertGreater(counts["Local dominant color"], 0)
+        self.assertGreaterEqual(
+            counts["Both"], counts["Local dominant color"]
+        )
 
 
 class NeighborRuleTests(unittest.TestCase):
